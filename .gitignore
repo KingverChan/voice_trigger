@@ -12,3 +12,6 @@ tts_cache/
 *.wav
 *.mp3
 voice-trigger.log
+
+# 诊断脚本输出
+tools/uia_dump.txt

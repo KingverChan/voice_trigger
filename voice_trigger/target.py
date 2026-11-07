@@ -184,6 +184,201 @@ def activate_window(hwnd, tries=10, interval=0.1):
     return False
 
 
+def _poke_chromium(hwnd):
+    """
+    给窗口内所有 Chrome_RenderWidgetHostHWND 子窗口发 WM_GETOBJECT (OBJID_CLIENT / UiaRootObjectId),
+    强制 Chromium 打开无障碍树 (跟 reply.py 的 poke() 是同一个套路)。
+    Electron/Chromium 默认不开放页面的 UIA 树, 第一次被问才打开, 所以找 Composer 前要先 poke 一下。
+    返回 poke 到的子窗口数 (0 = 没找到, 可能不是 Chromium 窗口, 或者还没加载)。
+    """
+    try:
+        ctypes, wintypes, u, _ = _win32()
+        hwnd = _hwnd(hwnd)
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.restype = ctypes.c_int
+        u.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.LPARAM]
+        u.EnumChildWindows.restype = wintypes.BOOL
+        u.SendMessageTimeoutW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM,
+                                           wintypes.LPARAM, ctypes.c_uint, ctypes.c_uint,
+                                           ctypes.POINTER(wintypes.DWORD)]
+        u.SendMessageTimeoutW.restype = ctypes.c_long
+        found = []
+        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def cb(h, _):
+            b = ctypes.create_unicode_buffer(64)
+            u.GetClassNameW(h, b, 64)
+            if b.value.startswith("Chrome_RenderWidgetHostHWND"):
+                found.append(h)
+            return True
+
+        u.EnumChildWindows(hwnd, proc(cb), 0)
+        res = wintypes.DWORD()
+        for h in found:
+            for obj in (-4, -25):  # OBJID_CLIENT, UiaRootObjectId
+                u.SendMessageTimeoutW(h, 0x003D, 0, obj, 2, 500, ctypes.byref(res))
+        return len(found)
+    except Exception:
+        return 0
+
+
+_COMPOSER_TYPES = ("EditControl", "DocumentControl")
+
+
+def _looks_like_composer(c, win_rect):
+    """粗判一个 UIA 控件像不像聊天输入框: 可编辑类型 + 有实际大小 + 不在屏幕外 + 大致在窗口下半部分
+    (聊天输入框习惯贴在窗口底部; 上半部分大多是历史消息, 同样可能是 EditControl/DocumentControl)。"""
+    try:
+        if c.ControlTypeName not in _COMPOSER_TYPES:
+            return False
+    except Exception:
+        return False
+    try:
+        r = c.BoundingRectangle
+        w, h = r.right - r.left, r.bottom - r.top
+        if w <= 0 or h <= 0:
+            return False
+    except Exception:
+        return False
+    if win_rect:
+        try:
+            _, top, _, bottom = win_rect
+            height = max(1, bottom - top)
+            if r.top < top + height * 0.35:
+                return False
+        except Exception:
+            pass
+    try:
+        if c.IsOffscreen:
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def find_composer(hwnd, max_depth=200, time_limit=2.0):
+    """
+    用 UIA 在目标窗口里找聊天输入框 (Composer): 先 poke 打开 Chromium 的无障碍树,
+    再整棵树找「可编辑类型 + 在窗口下半部分」的控件, 多个候选取面积最大的一个
+    (真正的输入框通常比旁边的小按钮/提示文字大)。
+
+    找不到 / 没装 uiautomation / 窗口已经不存在 / 不是 Chromium 窗口, 都返回 None ——
+    调用方 (focus_composer / try_set_composer_value) 据此退回旧的点击+粘贴流程, 不会抛异常。
+    """
+    try:
+        import uiautomation as auto
+    except ImportError:
+        return None
+    hwnd = _hwnd(hwnd)
+    if not hwnd:
+        return None
+    try:
+        _, _, u, _ = _win32()
+        if not u.IsWindow(hwnd):
+            return None
+    except Exception:
+        return None
+    try:
+        _poke_chromium(hwnd)
+        win_rect = client_rect(hwnd)
+        t0 = time.time()
+        with auto.UIAutomationInitializerInThread():
+            top = auto.ControlFromHandle(hwnd)
+            if top is None:
+                return None
+            best, best_area = None, 0
+            for c, _depth in auto.WalkControl(top, maxDepth=max_depth):
+                if time.time() - t0 > time_limit:
+                    break
+                if not _looks_like_composer(c, win_rect):
+                    continue
+                try:
+                    r = c.BoundingRectangle
+                    area = max(0, r.right - r.left) * max(0, r.bottom - r.top)
+                except Exception:
+                    area = 0
+                if area > best_area:
+                    best, best_area = c, area
+            return best
+    except Exception:
+        return None
+
+
+def focus_composer(hwnd):
+    """
+    找到 Composer 并让它拿到键盘焦点 —— 解决"窗口在前台但输入框没焦点,
+    Ctrl+V/Enter 全部落空"的问题 (Chromium 的粘贴/回车只作用于真正聚焦的可编辑元素)。
+    先试 UIA 的 SetFocus() (不用动鼠标), 不行就点它的 BoundingRectangle 中心
+    (比旧的手动标定坐标更准: 跟着窗口当前的实际位置/大小算, 窗口挪动或缩放也不会跟标定时的坐标脱节)。
+    返回 True = 认为已经把焦点放进输入框; False = 两种办法都不行, 调用方退回原来的
+    click_before_paste 兜底坐标 / 直接粘贴流程。
+    """
+    c = find_composer(hwnd)
+    if c is None:
+        return False
+    try:
+        c.SetFocus()
+        return True
+    except Exception:
+        pass
+    try:
+        r = c.BoundingRectangle
+        cx, cy = int((r.left + r.right) / 2), int((r.top + r.bottom) / 2)
+        import pyautogui
+        pyautogui.click(cx, cy)
+        return True
+    except Exception:
+        return False
+
+
+def try_set_composer_value(hwnd, text):
+    """
+    如果 Composer 支持 ValuePattern (比如纯 <textarea>, 不是常见的 contenteditable div),
+    直接把文字写进去, 完全绕开剪贴板和"谁有键盘焦点"的问题。
+    大多数聊天框是 contenteditable, 不支持 ValuePattern, 这时规规矩矩返回 False,
+    调用方再走 focus_composer() + 剪贴板 Ctrl+V 的老路。
+    """
+    if not text:
+        return False
+    c = find_composer(hwnd)
+    if c is None:
+        return False
+    try:
+        vp = c.GetValuePattern()
+        if vp is None:
+            return False
+        vp.SetValue(text)
+        return True
+    except Exception:
+        return False
+
+
+def read_composer_text(hwnd):
+    """
+    读 Composer 当前的文字 (ValuePattern.Value, 不行就 TextPattern 整段, 再不行用 Name)。
+    只用来诊断/校验 (比如确认写进去了没有), 不在发送流程里调用。读不到返回 None。
+    """
+    c = find_composer(hwnd)
+    if c is None:
+        return None
+    try:
+        vp = c.GetValuePattern()
+        if vp is not None:
+            return vp.Value
+    except Exception:
+        pass
+    try:
+        tp = c.GetTextPattern()
+        if tp is not None:
+            return tp.DocumentRange.GetText(-1)
+    except Exception:
+        pass
+    try:
+        return c.Name
+    except Exception:
+        return None
+
+
 def is_own_window(hwnd):
     """前台窗口是不是发发自己的 (面板/控制台)。"""
     try:

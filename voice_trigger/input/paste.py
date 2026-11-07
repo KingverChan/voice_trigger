@@ -9,7 +9,8 @@ import time
 
 from ..journal import mark_pasting
 from ..target import (activate_window, click_point, describe_target,
-                      find_target_window, is_foreground, window_at_point)
+                      find_target_window, focus_composer, is_foreground,
+                      try_set_composer_value, window_at_point)
 from ..windows import foreground_window, match_words, window_info
 from .clipboard import read_clipboard, set_clipboard_image
 
@@ -139,14 +140,28 @@ def send_text(cfg, text, image=None, dry_run=False):
                 return False
         enter = bool(cfg.get("press_enter", True))
         if text:
-            # 3. 文字: 剪贴板设文本 -> Ctrl+V -> 等 300ms -> Enter
-            pyperclip.copy(text)
-            pyautogui.hotkey("ctrl", "v")
-            time.sleep(0.3)
-            if enter:
-                pyautogui.press("enter")
-            time.sleep(0.2)
-            print(f"  已粘贴文字{'并回车' if enter else ' (没回车)'} (未校验输入框内容): {text}")
+            # 3. 文字: 窗口在前台不代表输入框有焦点 (Chromium 的 Ctrl+V/Enter 只认真正聚焦的
+            # 可编辑元素), 先用 UIA 找 Composer。支持 ValuePattern 就直接写值, 完全绕开剪贴板
+            # 和焦点问题; 不支持就 SetFocus()/点它的中心, 再走剪贴板 Ctrl+V 的老路。
+            # 两者都找不到 Composer (没装 uiautomation、不是 Chromium 窗口等) 就什么都不做,
+            # 直接退回原来"假设焦点已经在输入框上"的粘贴流程, 行为跟以前完全一样。
+            if try_set_composer_value(hwnd, text):
+                if enter:
+                    pyautogui.press("enter")
+                time.sleep(0.2)
+                print(f"  已用 UIA 直接写入 Composer{'并回车' if enter else ' (没回车)'}: {text}")
+            else:
+                focused = bool(focus_composer(hwnd))
+                pyperclip.copy(text)
+                pyautogui.hotkey("ctrl", "v")
+                time.sleep(0.3)
+                if enter:
+                    pyautogui.press("enter")
+                time.sleep(0.2)
+                if focused:
+                    print(f"  已用 UIA 定位到输入框并聚焦, 粘贴文字{'并回车' if enter else ' (没回车)'}: {text}")
+                else:
+                    print(f"  UIA 没找到输入框, 按旧方式粘贴文字{'并回车' if enter else ' (没回车)'} (未校验): {text}")
         if image is not None:
             # 4. 图片: 单独一条消息
             set_clipboard_image(image)
