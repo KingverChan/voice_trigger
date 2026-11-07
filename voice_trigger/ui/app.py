@@ -164,20 +164,9 @@ class App:
         self.pcall = tk.BooleanVar(value=cfg.get("pause_on_call", False))
         rows_adv.add("通话软件用麦克风时暂停", ttk.Checkbutton(box_adv, variable=self.pcall), "Teams/Zoom/微信等")
 
-        self.route = tk.BooleanVar(value=cfg.get("window_routing", False))
-        rows_adv.add("按窗口自动选择发送方式", ttk.Checkbutton(box_adv, variable=self.route), "Word/微信=直接打字, AI 窗口=发送")
-        self.dic = tk.StringVar(value=", ".join(cfg.get("dictation_windows", [
-            "winword.exe", "wechat.exe", "weixin.exe", "typora", "code.exe", "obsidian", "notepad"])))
-        rows_adv.add("听写窗口 (直接打字)", ttk.Entry(box_adv, textvariable=self.dic), "程序名或标题关键词")
-        self.aiw = tk.StringVar(value=", ".join(cfg.get("ai_windows", ["claude", "豆包", "deepseek", "chatgpt"])))
-        rows_adv.add("AI 窗口 (点聊天框发送)", ttk.Entry(box_adv, textvariable=self.aiw), "其他窗口不发")
-        self.fg = tk.StringVar(value="(切到别的窗口再切回来就会显示)")
-        self.last_fg = ("", "")
-        f2 = ttk.Frame(box_adv)
-        ttk.Label(f2, textvariable=self.fg, width=34).pack(side="left")
-        ttk.Button(f2, text="加入听写", command=lambda: self.add_window(self.dic)).pack(side="left", padx=2)
-        ttk.Button(f2, text="加入 AI", command=lambda: self.add_window(self.aiw)).pack(side="left", padx=2)
-        rows_adv.add("刚才用的窗口", f2)
+        self.replyw = tk.StringVar(value=", ".join(cfg.get("reply_window_words", [
+            "claude", "豆包", "deepseek", "chatgpt"])))
+        rows_adv.add("念回复时找这些窗口", ttk.Entry(box_adv, textvariable=self.replyw), "只用来读取回复文字")
         self.sel = tk.BooleanVar(value=cfg.get("attach_selection", False))
         rows_adv.add("说话时带上选中文字", ttk.Checkbutton(box_adv, variable=self.sel), "框选的文字/代码一起发给 AI")
 
@@ -216,12 +205,14 @@ class App:
         rows.add("识别模型", ttk.Combobox(box, textvariable=self.model, values=["base", "small", "medium"],
                                           state="readonly", width=10), "medium 更准但更慢")
 
-        box_pos = cfg.get("input_box")
-        self.pos = tk.StringVar(value=f"{box_pos[0]}, {box_pos[1]}" if box_pos else "还没记录")
-        f = ttk.Frame(box)
-        ttk.Label(f, textvariable=self.pos).pack(side="left")
-        ttk.Button(f, text="重新记录", command=self.calibrate).pack(side="left", padx=8)
-        rows.add("聊天输入框位置", f)
+        tw = cfg.get("target_window") or {}
+        self.target_info = tk.StringVar(
+            value=(f"「{tw.get('title_substr') or '?'}」({tw.get('exe') or '?'})" if tw else "还没标记"))
+        ft = ttk.Frame(box)
+        ttk.Label(ft, textvariable=self.target_info, width=30).pack(side="left")
+        ttk.Button(ft, text="标记对话窗口", command=self.mark_target).pack(side="left", padx=4)
+        ttk.Button(ft, text="标定点击点", command=self.calibrate).pack(side="left", padx=4)
+        rows.add("发送目标", ft, "先点一下那个对话框, 再点「标记对话窗口」")
 
         # ---------- 日志页 ----------
         logf = ttk.LabelFrame(self.tab_log, text="最近识别记录 (voice-trigger.log)")
@@ -275,26 +266,8 @@ class App:
             self.auto_var.set(f"自动发送: 关 (要说发发)   热键 {hk}")
             self.auto_lbl.configure(fg="#555")
 
-    def add_window(self, var):
-        """把刚才用的那个窗口加进列表: 普通软件加程序名; 浏览器加网页标题里最后一段 (比如 Claude)"""
-        title, exe = self.last_fg
-        if not exe and not title:
-            messagebox.showinfo("发发", "先切到那个窗口用一下, 再切回面板点这个按钮")
-            return
-        browsers = ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe")
-        if exe.lower() in browsers or not exe:
-            t = title.rsplit(" - ", 1)[0] if " - " in title else title
-            word = t.rsplit(" - ", 1)[-1].strip() or title
-        else:
-            word = exe.lower()
-        words = split_words(var.get())
-        if word.lower() not in [w.lower() for w in words]:
-            words.append(word)
-        var.set(", ".join(words))
-        self.status.set(f"已加入「{word}」, 记得点保存")
-
     def probe_reply(self):
-        """后台: 没装 uiautomation 就装上, 倒数 3 秒, 试读聊天框所在窗口的文字, 结果显示在面板上。"""
+        """后台: 没装 uiautomation 就装上, 倒数 3 秒, 试读标记对话窗口的文字, 结果显示在面板上。"""
         py = str(Path(sys.executable).with_name("python.exe"))
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")  # 中文输出不出错
         self.probe_btn.configure(state="disabled")
@@ -397,24 +370,56 @@ class App:
         run_ps1("autostart_on.ps1" if self.autostart.get() else "autostart_off.ps1")
         self.autostart.set(STARTUP_LNK.exists())
 
+    def mark_target(self):
+        """点按钮后 5 秒内点一下目标对话框, 再调用和 --mark-target 同一段标记逻辑。"""
+        from ..target import mark_target
+        messagebox.showinfo("标记对话窗口", "点「确定」后 5 秒内, 点一下要发送到的那个对话框。")
+        self.root.iconify()
+
+        def later():
+            cfg = read_config()
+            ok = mark_target(cfg)
+            self.root.deiconify()
+            if ok:
+                tw = cfg.get("target_window") or {}
+                self.target_info.set(f"「{tw.get('title_substr') or '?'}」({tw.get('exe') or '?'})")
+                self.ask_restart("已标记目标窗口")
+            else:
+                messagebox.showinfo("发发", "没标记成: 前台不能是发发自己。再点一次按钮, "
+                                            "然后马上点到目标对话框上。")
+
+        self.root.after(5000, later)
+
     def calibrate(self):
+        """标定兜底点击点: 5 秒内把鼠标放到标记窗口的输入框上。"""
         import pyautogui
+        from ..target import calibrate_click, find_target_window
+        cfg = read_config()
+        if not cfg.get("target_window"):
+            messagebox.showinfo("发发", "还没标记目标窗口, 先点「标记对话窗口」")
+            return
+        if not find_target_window(cfg["target_window"]):
+            messagebox.showinfo("发发", "标记的窗口不见了, 重新点「标记对话窗口」")
+            return
         win = tk.Toplevel(self.root)
         win.attributes("-topmost", True)
-        win.title("记录输入框位置")
+        win.title("标定兜底点击点")
         msg = tk.StringVar()
         tk.Label(win, textvariable=msg, font=("Microsoft YaHei UI", 12), padx=20, pady=20).pack()
 
         def tick(n):
             if n > 0:
-                msg.set(f"把鼠标移到聊天输入框上, 别动\n{n} 秒后记录")
+                msg.set(f"把鼠标移到标记窗口的输入框上, 别动\n{n} 秒后记录")
                 win.after(1000, tick, n - 1)
             else:
                 x, y = pyautogui.position()
-                write_config({"input_box": [int(x), int(y)]})
-                self.pos.set(f"{x}, {y}")
+                ok, text = calibrate_click(read_config(), x, y)
                 win.destroy()
-                self.ask_restart("输入框位置已保存")
+                self.status.set(text)
+                if ok:
+                    self.ask_restart("兜底点击点已保存")
+                else:
+                    messagebox.showwarning("发发", text)
         tick(5)
 
     def save(self):
@@ -441,9 +446,7 @@ class App:
                 "tts_voice_en": self.voice.get(),
                 "tts_skip_words": split_words(self.skipw.get()),
                 "ai_context": bool(self.actx.get()),
-                "window_routing": bool(self.route.get()),
-                "dictation_windows": split_words(self.dic.get()),
-                "ai_windows": split_words(self.aiw.get()),
+                "reply_window_words": split_words(self.replyw.get()),
                 "attach_selection": bool(self.sel.get()),
                 "ai_turn": bool(self.aturn.get()),
                 "ai_filter": bool(self.aif.get()),
@@ -476,14 +479,6 @@ class App:
             if on != getattr(self, "_tts_seen", on):
                 self.tts.set(on)
             self._tts_seen = on
-        except Exception:
-            pass
-        try:
-            from ..windows import foreground_window
-            t, e = foreground_window()
-            if e and "发发" not in t and e.lower() not in ("pythonw.exe", "python.exe"):
-                self.last_fg = (t, e)
-                self.fg.set(f"{t[:22]} ({e})")
         except Exception:
             pass
         self.show_auto()

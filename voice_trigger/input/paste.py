@@ -1,31 +1,18 @@
 # -*- coding: utf-8 -*-
-"""把文字/图片粘贴到目标窗口 (聊天框, 或当前听写位置)。"""
+"""把文字/图片发到标记的那个对话窗口。
+
+路径 A (首选): 重新找到窗口 -> 激活并确认 -> 剪贴板设文字 -> Ctrl+V -> Enter
+路径 B (兜底): 激活失败时, 用 --calibrate 标定的相对客户区坐标点一下输入框 -> 粘贴 -> Enter
+图片永远单独作为第二条消息发: 文字一条, 图片一条, 不硬混在一起。
+"""
 import time
 
 from ..journal import mark_pasting
-from ..windows import foreground_window, match_words
+from ..target import (activate_window, click_point, describe_target,
+                      find_target_window)
+from ..windows import foreground_window, match_words, window_info
 from .clipboard import read_clipboard, set_clipboard_image
 
-def paste_here(cfg, text, dry_run=False):
-    """听写模式: 粘贴到你正在打字的地方。不点击、不移动鼠标、不回车, 剪贴板用完还原。"""
-    if dry_run:
-        print(f"  [dry-run] 会粘贴到当前位置: {text}")
-        return True
-    import pyautogui
-    import pyperclip
-    try:
-        old = pyperclip.paste()
-    except Exception:
-        old = None
-    mark_pasting(cfg)
-    pyperclip.copy(text)
-    pyautogui.hotkey("ctrl", "v")
-    time.sleep(0.15)
-    if old is not None:
-        pyperclip.copy(old)
-    mark_pasting(cfg)
-    print(f"  已粘贴: {text}")
-    return True
 
 def read_selection(cfg):
     """
@@ -72,48 +59,104 @@ def read_selection(cfg):
     mark_pasting(cfg)
     return sel, f"{exe}"
 
+
 def send_text(cfg, text, image=None, dry_run=False):
-    """粘贴文字 (有图片的话再粘贴图片), 然后回车。"""
+    """
+    发到 config.target_window 标记的窗口。返回 True = 粘贴/回车都做了；
+    False = 没发出去 (具体原因已经打印)。注意: 这里只能确认窗口激活了,
+    确认不了输入框里真的收到了, 所以打印的是「已粘贴并回车 (未校验)」。
+    """
+    target = cfg.get("target_window")
     if dry_run:
-        print(f"  [dry-run] 会发送:\n{text}")
+        print(f"  [dry-run] 目标窗口: {describe_target(target)}")
+        if text:
+            print(f"  [dry-run] 会粘贴文字并回车: {text}")
         if image is not None:
-            print(f"  [dry-run] 还会粘贴一张图片 {image.size[0]}x{image.size[1]}")
-        return
-    if not cfg.get("input_box"):
-        print("  还没记录输入框坐标, 先运行: python main.py --calibrate")
-        return
-    import pyautogui
-    import pyperclip
+            print(f"  [dry-run] 图片会单独作为第二条消息发: {image.size[0]}x{image.size[1]}")
+        if not text and image is None:
+            print("  [dry-run] 没有要发送的内容")
+        if not target:
+            print("  [dry-run] 注意: 还没标记目标窗口, 正式发送会失败 (先 --mark-target)")
+        return True
+
+    if not target:
+        print("  还没标记目标窗口, 先运行: python main.py --mark-target")
+        return False
+    if not text and image is None:
+        print("  没有要发送的内容")
+        return False
+
+    # 1. 按 exe + 标题重新找窗口 (窗口重开、hwnd 变了也能找到)
+    hwnd = find_target_window(target)
+    if not hwnd:
+        print("  标记的窗口不见了, 请重新运行: python main.py --mark-target")
+        return False
+    title, exe = window_info(hwnd)
+
+    # 2. 激活 + 确认; 失败就走兜底点击
+    point = None
+    if activate_window(hwnd):
+        print(f"  已激活「{title}」({exe})")
+    else:
+        point = click_point(target, hwnd)
+        if not point:
+            print(f"  激活「{title}」({exe}) 失败 (Windows 不让切到前台), 也没有标定兜底点击点")
+            print("  先运行: python main.py --calibrate (把鼠标移到它的输入框上)")
+            return False
+        print(f"  激活「{title}」失败, 用标定的位置 {point} 点一下输入框")
+
+    try:
+        import pyautogui
+        import pyperclip
+    except Exception as e:
+        print(f"  缺少键鼠/剪贴板库, 发不出去: {e}")
+        return False
+
+    old_mouse = pyautogui.position()  # 记住鼠标原来的位置
     old_text = None
-    if image is None:  # 剪贴板是图片时 old 就是这张图, 最后会放回去
+    if image is None:  # 剪贴板是图片时 old 就是这张图, 最后不用还原文字
         try:
             old_text = pyperclip.paste()
         except Exception:
             old_text = None
     mark_pasting(cfg)
-    old_mouse = pyautogui.position()  # 记住鼠标原来的位置
-    x, y = cfg["input_box"]
-    pyautogui.click(x, y)
-    time.sleep(0.2)
-    # 1. 粘贴文字
-    pyperclip.copy(text)
-    pyautogui.hotkey("ctrl", "v")
-    time.sleep(0.15)
-    # 2. 粘贴图片, 等它出现在输入框里
-    if image is not None:
-        try:
+    ok = False
+    try:
+        if point is not None:
+            pyautogui.click(point[0], point[1])
+            time.sleep(0.2)
+        enter = bool(cfg.get("press_enter", True))
+        if text:
+            # 3. 文字: 剪贴板设文本 -> Ctrl+V -> 等 300ms -> Enter
+            pyperclip.copy(text)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(0.3)
+            if enter:
+                pyautogui.press("enter")
+            time.sleep(0.2)
+            print(f"  已粘贴文字{'并回车' if enter else ' (没回车)'} (未校验输入框内容): {text}")
+        if image is not None:
+            # 4. 图片: 单独一条消息
             set_clipboard_image(image)
             pyautogui.hotkey("ctrl", "v")
             time.sleep(float(cfg.get("image_wait_s", 1.5)))
-        except Exception as e:
-            print(f"  图片粘贴失败: {e}")
-    # 3. 回车发送
-    if cfg.get("press_enter", True):
-        pyautogui.press("enter")
-    time.sleep(0.2)
-    pyautogui.moveTo(old_mouse[0], old_mouse[1])  # 鼠标移回原位
-    # 4. 还原剪贴板 (图片的情况剪贴板里已经是原来那张图)
-    if image is None and old_text is not None:
-        pyperclip.copy(old_text)
-    mark_pasting(cfg)
-    print(f"  已发送: {text}" + ("  + 1 张图片" if image is not None else ""))
+            if enter:
+                pyautogui.press("enter")
+            time.sleep(0.2)
+            print(f"  已粘贴图片{'并回车' if enter else ' (没回车)'} (未校验): "
+                  f"{image.size[0]}x{image.size[1]}")
+        ok = True
+    except Exception as e:
+        print(f"  发送失败: {type(e).__name__}: {e}")
+    finally:
+        try:
+            pyautogui.moveTo(old_mouse[0], old_mouse[1])  # 鼠标移回原位
+        except Exception:
+            pass
+        if image is None and old_text is not None:
+            try:
+                pyperclip.copy(old_text)  # 还原剪贴板
+            except Exception:
+                pass
+        mark_pasting(cfg)
+    return ok
