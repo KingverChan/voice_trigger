@@ -61,21 +61,13 @@ DEFAULT_CONFIG = {
                            "like", "um", "uh", "my", "your", "then", "which", "for", "in", "on"],
     "ai_turn_high": 0.9,
     "ai_turn_low": 0.3,
-    # 按窗口自动选择发送方式 (默认关 = 跟以前一样, 永远点聊天框发送):
-    #   前台是听写窗口 (Word/微信/编辑器) -> 直接粘贴到你正在打字的地方, 不点击、不回车、不附带剪贴板
-    #   前台是 AI 窗口 (Claude/豆包/DeepSeek) -> 跟以前一样点聊天框、粘贴、回车
-    #   其他窗口 -> 不发
-    # 关键词不分大小写, 匹配程序名 (如 winword.exe) 或窗口标题
-    "window_routing": False,
-    "dictation_windows": ["winword.exe", "wechat.exe", "weixin.exe", "typora", "code.exe",
-                          "obsidian", "notepad"],
-    "ai_windows": ["claude", "豆包", "deepseek", "chatgpt"],
-    # 说话时带上选中文字: 发送 (AI 模式) 前在你正在用的窗口按一下 Ctrl+C 读选中的内容, 读完还原剪贴板
+    # 目标对话窗口: 所有话都发到这里 (不再识别微信/Word/听写窗口, 也没有窗口路由)。
+    # 用 python main.py --mark-target 标记当前前台窗口; 结构见 voice_trigger/target.py。
+    # 激活失败时用 --calibrate 标定的 click_rel_x/click_rel_y 点一下输入框兜底。
+    "target_window": None,
+    # 说话时带上选中文字: 发送前在你正在用的窗口按一下 Ctrl+C 读选中的内容, 读完还原剪贴板
     "attach_selection": False,
     "selection_max_chars": 6000,
-    # 听写窗口里如果框选了文字 -> 当作"问 AI": 带上选中内容发到 AI 聊天框, 不在文档里打字
-    # (不然粘贴会把选中的内容替换掉)
-    "dictation_selection_to_ai": True,
     # 这些程序没选中东西时按 Ctrl+C 会复制整行 (VS Code), 复制到的正好是"一整行"就当没选中
     "selection_line_copy_apps": ["code.exe", "cursor.exe", "pycharm64.exe", "pycharm.exe", "idea64.exe",
                                  "clion64.exe", "webstorm64.exe", "goland64.exe", "rider64.exe", "studio64.exe"],
@@ -85,6 +77,8 @@ DEFAULT_CONFIG = {
     # 判断"是不是对 AI 说的"时带上对话上下文: 你上次发给 AI 的话 (和距今几秒),
     # 还会试着读 AI 窗口里最后的回复 (要装 uiautomation, 读不到就只带你自己的话)
     "ai_context": True,
+    # 念回复时按这些关键词找 AI 窗口 (只是读窗口文字用, 跟发到哪里无关)
+    "reply_window_words": ["claude", "豆包", "deepseek", "chatgpt"],
     "ai_context_max_s": 120,        # 上次发给 AI 超过 120 秒就不带了
     "ai_context_read_reply": True,
     "ai_context_reply_chars": 800,  # AI 回复只取最后 800 字, 只发给 DeepSeek, 不写日志
@@ -130,7 +124,6 @@ DEFAULT_CONFIG = {
     "max_speech_s": 15,
     "wait_command_s": 6,
     "send_delay_s": 2,
-    "input_box": None,
     "press_enter": True,
     # True = 你说的每一句话(不只是 fafa 指令)都带时间戳存进 daily-journal 的每日日志,
     # 会长期保存在硬盘上, 半夜会发给 DeepSeek 总结成日记。默认关, 想用自己改成 true。

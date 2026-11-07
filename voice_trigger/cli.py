@@ -7,32 +7,44 @@ import time
 from .asr import load_whisper
 from .audio.gpu import add_nvidia_dlls
 from .audio.mic import list_mics
-from .config import CONFIG_PATH, load_config, save_config
+from .config import load_config, save_config
 from .journal import setup_log
 from .reply import read_ai_reply
 from .runtime import bench, run, single_instance
+from .target import calibrate_click, describe_target, find_target_window, mark_target
 from .tts import Speaker, tts_lang
-from .windows import ROUTE_NAME, route_for
+
 
 def calibrate(cfg):
+    """标定兜底点击点: 鼠标当前位置 -> 标记窗口客户区的相对坐标。"""
     import pyautogui
-    print("把鼠标移到聊天输入框上, 5 秒后记录位置 (别动鼠标)...")
+    if not cfg.get("target_window"):
+        print("还没标记目标窗口, 先运行: python main.py --mark-target")
+        return
+    hwnd = find_target_window(cfg["target_window"])
+    if not hwnd:
+        print("标记的窗口不见了, 请重新运行: python main.py --mark-target")
+        return
+    print(f"目标窗口: {describe_target(cfg['target_window'])}")
+    print("只在激活失败时用它兜底。把鼠标移到这个窗口的输入框上, 5 秒后记录位置...")
     for i in range(5, 0, -1):
         print(f"  {i} ...  当前位置 {tuple(pyautogui.position())}")
         time.sleep(1)
     x, y = pyautogui.position()
-    cfg["input_box"] = [int(x), int(y)]
-    save_config(cfg)
-    print(f"已保存输入框坐标 ({x}, {y}) 到 {CONFIG_PATH.name}")
+    ok, msg = calibrate_click(cfg, x, y)
+    print(msg)
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--calibrate", action="store_true", help="记录输入框坐标")
+    ap.add_argument("--mark-target", action="store_true",
+                    help="把当前前台窗口标记为发送目标 (先点一下那个对话框再运行)")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="标定兜底点击点 (标记窗口激活失败时点输入框, 先 --mark-target)")
     ap.add_argument("--list-mics", "--list-devices", action="store_true", help="列出麦克风")
     ap.add_argument("--dry-run", action="store_true", help="只打印不发送")
     ap.add_argument("--log", action="store_true", help="输出写到 voice-trigger.log (后台运行用)")
     ap.add_argument("--bench", action="store_true", help="测 small/medium 在 CPU/显卡上转一句话要几秒")
-    ap.add_argument("--window", action="store_true", help="5 秒后看看前台是哪个窗口、会用哪种方式")
     ap.add_argument("--probe-reply", action="store_true", help="试试能不能读到 AI 窗口里的回复")
     ap.add_argument("--tts-test", help="试听: 念一句话")
     ap.add_argument("--gpu-check", action="store_true", help="测试显卡加速能不能用")
@@ -53,6 +65,13 @@ def main():
         cfg["smart_turn"] = True
     if args.list_mics:
         list_mics()
+    elif args.mark_target:
+        # 在终端里运行时前台是终端, 所以留 3 秒让你点到目标对话框上
+        print("3 秒内点一下要发送到的那个对话框...")
+        for i in (3, 2, 1):
+            print(f"  {i} ...")
+            time.sleep(1)
+        sys.exit(0 if mark_target(cfg) else 1)
     elif args.calibrate:
         calibrate(cfg)
     elif args.test_file:
@@ -60,12 +79,6 @@ def main():
     else:
         if args.bench:
             bench(cfg)
-            return
-        if args.window:
-            print("5 秒内切到你想测的窗口...")
-            time.sleep(5)
-            mode, t, e = route_for(dict(cfg, window_routing=True))
-            print(f"前台窗口: 「{t}」({e}) -> {ROUTE_NAME[mode]}")
             return
         if args.tts_test:
             sp = Speaker(cfg)

@@ -12,13 +12,12 @@ from .constants import SAMPLE_RATE
 from .input.autoflag import auto_on, set_auto
 from .input.clipboard import ClipWatch, read_clipboard, with_clipboard
 from .input.hotkey import beep, start_hotkey
-from .input.paste import paste_here, read_selection, send_text
+from .input.paste import read_selection, send_text
 from .journal import log_speech
 from .paths import BENCH_WAV, TTS_CMD
 from .reply import watch_reply, watch_reply_file
 from .tts import Speaker, tts_enabled
 from .wake import find_command, find_wake, normalize
-from .windows import ROUTE_NAME, remember_foreground, route_for
 
 def bench(cfg):
     """用 bench.wav (约 15 秒, 3 句话) 测速度: 每种组合先热身一次, 再计时一次。"""
@@ -72,7 +71,6 @@ def run(cfg, dry_run=False, test_file=None):
 
     # 时钟: 正常用真实时间; 用文件测试时按"读了多少帧"算时间, 这样 2 秒延迟也能测
     sim = {"t": 0.0, "step": 0.03}
-    dropped = {}   # 刚被判成"不发"的一段 (自动发送, AI 窗口): {"piece", "at", "win"}
 
     def clock():
         return sim["t"] if test_file else time.time()
@@ -106,28 +104,14 @@ def run(cfg, dry_run=False, test_file=None):
             buf.append((t_start, clock(), text))
             print(f"  [缓冲] 已攒 {len(buf)} 句, 说「发发」就发送")
 
-    def flush(route=None):
+    def flush():
         nonlocal pending, send_at, clip_baseline, pending_suffix
         text = "，".join(pending)
         pending, send_at, pending_suffix = [], None, False
         t = clock()
-        if route is None:
-            route = route_for(cfg)
-        mode, wt, we = route
-        if cfg.get("window_routing"):
-            print(f"  [窗口] 「{wt or '(无标题)'}」({we}) -> {ROUTE_NAME[mode]}")
-        if mode == "skip":
-            return
-        if mode == "other":
-            # 说了发发 (或者 AI 已经判断过是对 AI 说的) -> 按 AI 模式发送
-            print("  [窗口] 其他窗口, 按 AI 模式发送 (点聊天框)")
-            mode = "ai"
         watch.poll(t)
-        sel, sel_read = "", False
-
-        def grab_selection():
-            nonlocal sel_read
-            sel_read = True
+        sel = ""
+        if not dry_run and sys.platform == "win32" and cfg.get("attach_selection"):
             try:
                 got, where = read_selection(cfg)
             except Exception as e:
@@ -140,25 +124,9 @@ def run(cfg, dry_run=False, test_file=None):
                     note = f", 太长只带前 {limit} 字"
                     got = got[:limit] + "\n...(选中内容太长, 已截断)"
                 print(f"  [选中文字] 从 {where} 读到 {len(got)} 字{note}")
-                return got
-            print(f"  [选中文字] {where}")
-            return ""
-
-        can_read = not dry_run and sys.platform == "win32"
-        if mode == "dictation" and cfg.get("dictation_selection_to_ai", True) and can_read:
-            sel = grab_selection()
-            if sel:
-                print("  [窗口] 听写窗口里有选中内容 -> 当作问 AI, 发到聊天框 (不在文档里打字)")
-                mode = "ai"
-        if mode == "dictation":
-            if normalize(text) == last_sent["text"] and t - last_sent["at"] < cfg.get("dedup_s", 10):
-                print(f"  和刚才的一样, 不重复粘贴: {text}")
-                return
-            last_sent["text"], last_sent["at"] = normalize(text), t
-            paste_here(cfg, text, dry_run)
-            return
-        if not sel_read and cfg.get("attach_selection") and can_read:
-            sel = grab_selection()
+                sel = got
+            else:
+                print(f"  [选中文字] {where}")
         ok, ago = watch.recent(cmd_start, window)
         full, image = with_clipboard(cfg, text, clip_baseline, ok, ago)
         if sel:
@@ -174,7 +142,7 @@ def run(cfg, dry_run=False, test_file=None):
             print(f"  和刚才发的一样, 不重复发送: {text}")
             return
         last_sent["text"], last_sent["at"] = dedup_key, t
-        if send_text(cfg, full, image, dry_run) is not False:
+        if send_text(cfg, full, image, dry_run):
             last_ai["text"], last_ai["at"] = text, time.time()  # 给下次判断当上下文
             if tts_enabled(cfg) and not dry_run:
                 rt["last_send_at"] = time.time()
@@ -307,8 +275,6 @@ def run(cfg, dry_run=False, test_file=None):
                 print(f"[通话] {c} 正在用麦克风, 自动发送暂停" if c else "[通话] 结束, 自动发送恢复原来的设置")
         if not test_file and now - rt["checked"] > 0.3:  # 每 0.3 秒看一下开关有没有变
             rt["checked"] = now
-            if cfg.get("window_routing"):
-                remember_foreground()
             if TTS_CMD.exists():  # 面板上的「再念一遍」「停止念」
                 try:
                     c = TTS_CMD.read_text(encoding="utf-8").strip()
@@ -380,45 +346,14 @@ def run(cfg, dry_run=False, test_file=None):
             continue
 
         if rt["auto"]:
-            # 自动发送: 这句话直接发 (去掉里面的"发发"), 不等
+            # 自动发送: 这句话直接发到标记的窗口 (去掉里面的"发发"), 不等
             w = find_wake(text, words)
             piece = " ".join(x for x in w if x) if w else text
-            route = route_for(cfg)
-            if route[0] != "dictation":   # 听写时保留句末标点
-                piece = piece.strip(" ，,。.?？!！")
+            piece = piece.strip(" ，,。.?？!！")
             if len(normalize(piece)) < cfg.get("auto_min_chars", 2):
                 recent.append(text)
                 continue
-
-            def remember_drop(p, r):
-                """被判成"不发"的一段先记着: 紧接着的下一段要发的话, 把它拼到前面 (一句话被停顿切成两段时)"""
-                dropped.update(piece=p, at=clock(), win=(r[1], r[2]))
-
-            def merge_drop(p, r):
-                d = dict(dropped)
-                dropped.clear()
-                if d and (r[1], r[2]) == d["win"] and \
-                        last_start - d["at"] <= float(cfg.get("merge_dropped_s", 4)):
-                    print(f"  [合并了前一段] 「{d['piece']}」 + 这一段一起发")
-                    return d["piece"] + "，" + p
-                return p
-            if route[0] == "other":
-                # 其他窗口: 问 DeepSeek 是不是对 AI 说的; 是 -> 按 AI 模式发, 否/出错/没 key -> 不发
-                print(f"  [窗口] 其他窗口「{route[1] or '(无标题)'}」({route[2]}) -> 问 DeepSeek")
-                ok, why = ai_is_for_ai(cfg, piece, recent[-int(cfg.get("ai_filter_context", 3)):], last_ai)
-                recent.append(text)
-                del recent[:-10]
-                if ok:
-                    print(f"  [AI 判断] 是对 AI 说的: {why} -> 按 AI 模式发送")
-                    piece = merge_drop(piece, route)
-                    route = ("ai", route[1], route[2])
-                    pending, pending_suffix, cmd_start = [piece], True, last_start
-                    flush(route)
-                else:
-                    print(f"  [AI 判断] {'不是对 AI 说的' if ok is False else '没判断成'}: {why} -> 不发")
-                    remember_drop(piece, route)
-                continue
-            if ai_filter and route[0] == "ai":  # 听写模式不用判断"是不是对 AI 说的"
+            if ai_filter:
                 ok, why = ai_is_for_ai(cfg, piece, recent[-int(cfg.get("ai_filter_context", 3)):], last_ai)
                 recent.append(text)
                 del recent[:-10]
@@ -426,17 +361,14 @@ def run(cfg, dry_run=False, test_file=None):
                     send = cfg.get("ai_filter_on_error", "drop") == "send"
                     print(f"  [AI 判断] 没判断成: {why} -> {'照样发' if send else '不发'}")
                     if not send:
-                        remember_drop(piece, route)
                         continue
                 elif not ok:
                     print(f"  [AI 判断] 不是对 AI 说的: {why} -> 不发")
-                    remember_drop(piece, route)
                     continue
                 else:
                     print(f"  [AI 判断] 是对 AI 说的: {why} -> 发送")
-                piece = merge_drop(piece, route)
             pending, pending_suffix, cmd_start = [piece], True, last_start
-            flush(route)
+            flush()
             continue
 
         wake = find_wake(text, words)

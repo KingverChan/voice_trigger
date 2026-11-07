@@ -13,7 +13,7 @@ from .windows import window_info
 def read_ai_reply(cfg, max_chars=800, time_limit=2.5):
     """
     用 Windows UI Automation 读 AI 聊天窗口里的文字, 取最后 max_chars 字 (大致就是 AI 最近的回复)。
-    找窗口: 先看聊天框坐标所在的窗口, 再按 ai_windows 关键词找标题/程序名对得上的窗口。
+    找窗口: 先看标记的对话窗口, 再按 reply_window_words 关键词找标题/程序名对得上的窗口。
     Claude / 浏览器是 Chromium 内核, 平时不开放页面文字, 第一次被问时才打开, 所以读不到会等 1 秒再读一次。
     只在判断时读一次。返回 (文字, 说明)。
     """
@@ -24,7 +24,7 @@ def read_ai_reply(cfg, max_chars=800, time_limit=2.5):
     except ImportError:
         return "", "没装 uiautomation (在面板点「安装并测试读取 AI 回复」)"
     t0 = time.time()
-    words = [w.lower() for w in cfg.get("ai_windows", ["claude", "豆包", "deepseek", "chatgpt"])]
+    words = [w.lower() for w in cfg.get("reply_window_words", ["claude", "豆包", "deepseek", "chatgpt"])]
 
     def desc(w):
         try:
@@ -85,11 +85,13 @@ def read_ai_reply(cfg, max_chars=800, time_limit=2.5):
 
     with auto.UIAutomationInitializerInThread():
         cands = []
-        if cfg.get("input_box"):
+        if cfg.get("target_window"):
             try:
-                c = auto.ControlFromPoint(*map(int, cfg["input_box"]))
+                from .target import find_target_window
+                hwnd = find_target_window(cfg["target_window"])
+                c = auto.ControlFromHandle(hwnd) if hwnd else None
                 if c is not None:
-                    cands.append(c.GetTopLevelControl())
+                    cands.append(c)
             except Exception:
                 pass
         try:
@@ -100,7 +102,8 @@ def read_ai_reply(cfg, max_chars=800, time_limit=2.5):
         except Exception:
             pass
         if not cands:
-            return "", "没找到 AI 窗口 (聊天框位置上没窗口, 也没有标题含 claude/豆包/deepseek 的窗口)"
+            return "", ("没找到可读的窗口 (标记的对话窗口不在, 也没有标题含 "
+                        "claude/豆包/deepseek 的窗口)")
         seen, notes = set(), []
         for w in cands:
             try:
