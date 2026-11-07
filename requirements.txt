@@ -1,0 +1,8 @@
+faster-whisper
+sounddevice
+webrtcvad-wheels
+numpy
+pyautogui
+pyperclip
+pillow
+pywin32

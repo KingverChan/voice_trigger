@@ -1,0 +1,793 @@
+# -*- coding: utf-8 -*-
+"""
+voice-trigger 最小版
+麦克风持续监听 -> VAD 切句 (默认 Silero, 可退回 webrtc) -> 本地 faster-whisper 转文字
+-> 句子里有唤醒词(fafa 及别名)时, 把后面的话粘贴到聊天输入框并回车。
+录音只在内存里, 不存文件。
+
+用法:
+  python main.py --calibrate     第一次: 记录聊天输入框坐标
+  python main.py                 开始监听 (Ctrl+C 退出)
+  python main.py --list-mics     查看麦克风编号
+  python main.py --dry-run       只打印, 不点击不粘贴 (调唤醒词用)
+  python main.py --test-file a.wav [--mode both] [--vad silero]
+                                 用录音文件测试切句+识别+唤醒 (只打印)
+"""
+import argparse
+import json
+import queue
+import re
+import sys
+import time
+from pathlib import Path
+
+CONFIG_PATH = Path(__file__).with_name("config.json")
+
+DEFAULT_CONFIG = {
+    "wake_words": ["fafa", "fa fa", "发发", "發發"],
+    "model_size": "small",
+    "device": "cpu",
+    "compute_type": "int8",
+    "language": "zh",
+    "mic_device": None,
+    # 切句用哪个 VAD: "silero" = 神经网络 VAD (更准, 抗键盘/风扇声);
+    # "webrtc" = 原来的老办法。silero 出问题时会自动退回 webrtc。
+    "vad_engine": "silero",
+    "silero_threshold": 0.5,       # 人声概率大于它算"开始说话"
+    "silero_neg_threshold": 0.35,  # 说话中, 概率低于它才算"安静" (迟滞, 防来回跳)
+    "silero_start_frames": 3,      # 连续 3 帧(约 96ms)有声才算开口, 过滤"咔"一声
+    # 触发方式: "prefix" = 先说发发再说指令 (原来的);
+    # "suffix" = 先说话, 最后说发发 -> 把前面攒的话一起发出去;
+    # "both" = 两种都行 (发发后面有话 = prefix, 发发前面有话/攒了话 = suffix)
+    "trigger_mode": "prefix",
+    "buffer_max_s": 60,   # suffix: 只攒最近 60 秒的话
+    "buffer_gap_s": 8,    # suffix: 两句之间停了超过 8 秒, 前面的清空重来
+    "vad_aggressiveness": 3,
+    "silence_end_ms": 800,
+    "min_speech_ms": 500,
+    "min_continuous_ms": 240,
+    "no_speech_prob_max": 0.5,
+    "avg_logprob_min": -1.0,
+    "min_command_chars": 2,
+    "dedup_s": 10,
+    "energy_ratio": 2.5,
+    "min_rms": 300,
+    "attach_clipboard": True,
+    "attach_only_new": True,
+    "attach_max_chars": 4000,
+    "image_wait_s": 1.5,
+    "attach_window_s": 10,
+    "max_speech_s": 15,
+    "wait_command_s": 6,
+    "send_delay_s": 2,
+    "input_box": None,
+    "press_enter": True,
+    # True = 你说的每一句话(不只是 fafa 指令)都带时间戳存进 daily-journal 的每日日志,
+    # 会长期保存在硬盘上, 半夜会发给 DeepSeek 总结成日记。默认关, 想用自己改成 true。
+    "log_all_speech": False,
+    "daily_journal_dir": "../daily-journal",
+}
+
+SAMPLE_RATE = 16000
+FRAME_MS = 30
+FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 480
+
+# 去掉标点和空格, 用来做匹配
+_PUNCT = re.compile(r"[\s,，.。!！?？、;；:：\"'“”‘’…~\-—()（）\[\]【】]+")
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    else:
+        save_config(cfg)
+    return cfg
+
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def normalize(s):
+    return _PUNCT.sub("", s).lower()
+
+
+def find_wake(text, wake_words):
+    """
+    找第一个唤醒词。没有返回 None, 有返回 (唤醒词前面的话, 唤醒词后面的话)。
+    """
+    # 在"去标点小写"的文本里找, 再映射回原文位置, 这样 "Fa, fa" 也能命中
+    keep = [i for i, ch in enumerate(text) if not _PUNCT.fullmatch(ch)]
+    norm = "".join(text[i] for i in keep).lower()
+    best = None  # (结束位置)
+    for w in wake_words:
+        nw = normalize(w)
+        if not nw:
+            continue
+        pos = norm.find(nw)
+        if pos != -1:
+            end = pos + len(nw)
+            if best is None or pos < best[0]:
+                best = (pos, end)
+    if best is None:
+        return None
+    before = text[:keep[best[0]]] if best[0] < len(keep) else ""
+    before = _PUNCT.sub(" ", before).strip(" ，,。.")
+    end_in_norm = best[1]
+    if end_in_norm >= len(keep):
+        return before, ""
+    start_in_text = keep[end_in_norm]
+    return before, _PUNCT.sub(" ", text[start_in_text:]).strip(" ，,。.")
+
+
+def find_command(text, wake_words):
+    """
+    返回 None: 没有唤醒词
+    返回 "":   有唤醒词但后面没话 (等下一句当指令)
+    返回 "xxx": 唤醒词后面的指令
+    """
+    r = find_wake(text, wake_words)
+    return None if r is None else r[1]
+
+
+def _journal_dir(cfg):
+    d = Path(cfg.get("daily_journal_dir") or "../daily-journal")
+    if not d.is_absolute():
+        d = (Path(__file__).resolve().parent / d).resolve()
+    return d
+
+
+def log_speech(cfg, text):
+    """log_all_speech 打开时, 把识别出的一句话写进 daily-journal\\logs\\今天.jsonl。"""
+    if not cfg.get("log_all_speech"):
+        return
+    d = _journal_dir(cfg)
+    if (d / "PAUSED").exists():  # daily-journal 的 pause.bat 也会暂停语音记录
+        return
+    try:
+        logs = d / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        ts = time.localtime()
+        rec = {"t": time.strftime("%H:%M:%S", ts), "src": "voice", "text": text}
+        with open(logs / f"{time.strftime('%Y-%m-%d', ts)}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"  写每日日志失败: {e}")
+
+
+def mark_pasting(cfg):
+    """告诉 daily-journal 的剪贴板记录器: 接下来几秒剪贴板变化是我们自己粘贴, 别记。"""
+    try:
+        d = _journal_dir(cfg)
+        if d.exists():
+            (d / ".voice_trigger_pasting").write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def calibrate(cfg):
+    import pyautogui
+    print("把鼠标移到聊天输入框上, 5 秒后记录位置 (别动鼠标)...")
+    for i in range(5, 0, -1):
+        print(f"  {i} ...  当前位置 {tuple(pyautogui.position())}")
+        time.sleep(1)
+    x, y = pyautogui.position()
+    cfg["input_box"] = [int(x), int(y)]
+    save_config(cfg)
+    print(f"已保存输入框坐标 ({x}, {y}) 到 {CONFIG_PATH.name}")
+
+
+def set_clipboard_image(img):
+    """把 PIL 图片放进 Windows 剪贴板 (CF_DIB 格式), 聊天框就能 Ctrl+V 粘贴图片。"""
+    import io
+    import win32clipboard
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "BMP")
+    data = buf.getvalue()[14:]  # 去掉 BMP 文件头, 剩下的就是 DIB
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
+def send_text(cfg, text, image=None, dry_run=False):
+    """粘贴文字 (有图片的话再粘贴图片), 然后回车。"""
+    if dry_run:
+        print(f"  [dry-run] 会发送:\n{text}")
+        if image is not None:
+            print(f"  [dry-run] 还会粘贴一张图片 {image.size[0]}x{image.size[1]}")
+        return
+    if not cfg.get("input_box"):
+        print("  还没记录输入框坐标, 先运行: python main.py --calibrate")
+        return
+    import pyautogui
+    import pyperclip
+    old_text = None
+    if image is None:  # 剪贴板是图片时 old 就是这张图, 最后会放回去
+        try:
+            old_text = pyperclip.paste()
+        except Exception:
+            old_text = None
+    mark_pasting(cfg)
+    old_mouse = pyautogui.position()  # 记住鼠标原来的位置
+    x, y = cfg["input_box"]
+    pyautogui.click(x, y)
+    time.sleep(0.2)
+    # 1. 粘贴文字
+    pyperclip.copy(text)
+    pyautogui.hotkey("ctrl", "v")
+    time.sleep(0.15)
+    # 2. 粘贴图片, 等它出现在输入框里
+    if image is not None:
+        try:
+            set_clipboard_image(image)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(float(cfg.get("image_wait_s", 1.5)))
+        except Exception as e:
+            print(f"  图片粘贴失败: {e}")
+    # 3. 回车发送
+    if cfg.get("press_enter", True):
+        pyautogui.press("enter")
+    time.sleep(0.2)
+    pyautogui.moveTo(old_mouse[0], old_mouse[1])  # 鼠标移回原位
+    # 4. 还原剪贴板 (图片的情况剪贴板里已经是原来那张图)
+    if image is None and old_text is not None:
+        pyperclip.copy(old_text)
+    mark_pasting(cfg)
+    print(f"  已发送: {text}" + ("  + 1 张图片" if image is not None else ""))
+
+
+LOOPBACK_HINTS = ("立体声混音", "stereo mix", "loopback", "what u hear", "wave out")
+
+
+def read_clipboard():
+    """
+    读剪贴板, 返回 (文字, 图片, 指纹)。
+    文字: 没有就 ""; 图片: PIL Image 或 None; 指纹: 用来判断是不是"新复制"的。
+    """
+    try:
+        from PIL import ImageGrab, Image
+        g = ImageGrab.grabclipboard()
+        if isinstance(g, Image.Image):
+            import hashlib
+            return "", g, "img:" + hashlib.md5(g.convert("RGB").tobytes()).hexdigest()
+    except Exception:
+        pass
+    try:
+        import pyperclip
+        t = pyperclip.paste()
+        t = t if isinstance(t, str) else ""
+    except Exception:
+        t = ""
+    return t, None, "txt:" + t
+
+
+def with_clipboard(cfg, text, baseline_key, in_window=True, ago=None):
+    """
+    如果剪贴板里有新复制的文字/图片, 一起带上。
+    返回 (要发送的文字, 要粘贴的图片或 None)。
+    """
+    if not cfg.get("attach_clipboard", True):
+        return text, None
+    clip, img, key = read_clipboard()
+    if cfg.get("attach_only_new", True) and key == baseline_key:
+        return text, None  # 上次发送/启动之后没有新复制, 不附带
+    if not in_window:
+        if ago is not None and (img is not None or clip.strip()):
+            print(f"  剪贴板内容是说话前 {ago:.0f} 秒复制的, 超过 "
+                  f"{cfg.get('attach_window_s', 10)} 秒, 认为无关, 不附带")
+        return text, None
+    if img is not None:
+        print(f"  附带复制的图片 {img.size[0]}x{img.size[1]}")
+        return text, img
+    if not clip.strip():
+        return text, None
+    limit = int(cfg.get("attach_max_chars", 4000))
+    if len(clip) > limit:
+        print(f"  复制的内容有 {len(clip)} 字, 只附带前 {limit} 字")
+        clip = clip[:limit] + "\n...(内容太长, 已截断)"
+    print(f"  附带复制内容 {len(clip)} 字")
+    return f"{text}\n\n【附带的复制内容】\n{clip}", None
+
+
+class ClipWatch:
+    """记录剪贴板最后一次被(你)改动的时间。Windows 用剪贴板序号, 很便宜, 可以一直查。"""
+
+    def __init__(self):
+        try:
+            import ctypes
+            self._seq = ctypes.windll.user32.GetClipboardSequenceNumber
+        except Exception:
+            self._seq = None  # 非 Windows: 不做时间限制
+        self.last = self._seq() if self._seq else 0
+        self.changed_at = None  # 启动前就有的内容不算
+
+    def poll(self, now):
+        if self._seq:
+            n = self._seq()
+            if n != self.last:
+                self.last = n
+                self.changed_at = now
+
+    def consume(self):
+        """我们自己发送时改了剪贴板, 不算你复制; 已附带过的也清掉。"""
+        if self._seq:
+            self.last = self._seq()
+        self.changed_at = None
+
+    def recent(self, cmd_start, window):
+        """返回 (是否在时间窗口内, 复制时间比开口早了几秒)。"""
+        if not self._seq:
+            return True, 0
+        if self.changed_at is None:
+            return False, None
+        ago = cmd_start - self.changed_at
+        return ago <= window, ago
+
+
+def list_mics():
+    import sounddevice as sd
+    default_in = sd.default.device[0]
+    print("可用的输入设备 (把编号填进 config.json 的 mic_device):")
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0:
+            tag = ""
+            if any(h in d["name"].lower() for h in LOOPBACK_HINTS):
+                tag = "   <- 这是电脑声音(内录), 不要选"
+            elif i == default_in:
+                tag = "   <- 当前默认"
+            print(f"  {i}: {d['name']}{tag}")
+
+
+def check_mic(cfg):
+    """启动时打印用的是哪个麦克风; 如果选到了"立体声混音"直接退出。"""
+    import sounddevice as sd
+    dev = cfg.get("mic_device")
+    info = sd.query_devices(dev if dev is not None else sd.default.device[0])
+    name = info["name"]
+    print(f"使用麦克风: {name}")
+    if any(h in name.lower() for h in LOOPBACK_HINTS):
+        print("这个设备录的是电脑播放的声音, 不是麦克风。")
+        print("运行 python main.py --list-mics 找到真正的麦克风, 填进 config.json 的 mic_device")
+        sys.exit(1)
+
+
+class SileroVAD:
+    """
+    Silero VAD (神经网络), 一次喂一帧 512 个采样点 (16kHz 下 32ms), 返回 0~1 的人声概率。
+    模型文件用 faster-whisper 自带的 silero_vad_v6.onnx, 不用另外装 torch。
+    原理和 vad-lab 一样, 只是这里直接用 onnxruntime 跑, 并且自己保存模型的"记忆"(h, c)。
+    """
+    FRAME = 512
+    CONTEXT = 64  # 模型要求每帧前面拼上上一帧最后 64 个点
+
+    def __init__(self):
+        import numpy as np
+        import onnxruntime
+        import faster_whisper
+        path = Path(faster_whisper.__file__).parent / "assets" / "silero_vad_v6.onnx"
+        opts = onnxruntime.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        opts.log_severity_level = 4
+        self.sess = onnxruntime.InferenceSession(str(path), providers=["CPUExecutionProvider"],
+                                                 sess_options=opts)
+        self.np = np
+        self.h = np.zeros((1, 1, 128), dtype=np.float32)
+        self.c = np.zeros((1, 1, 128), dtype=np.float32)
+        self.ctx = np.zeros(self.CONTEXT, dtype=np.float32)
+
+    def prob(self, x):
+        """x: float32, 长度 512, 范围 -1~1"""
+        np = self.np
+        inp = np.concatenate([self.ctx, x]).astype(np.float32)[None, :]
+        out, self.h, self.c = self.sess.run(None, {"input": inp, "h": self.h, "c": self.c})
+        self.ctx = x[-self.CONTEXT:].astype(np.float32)
+        return float(np.asarray(out).ravel()[0])
+
+
+def mic_frames(cfg, frame_samples):
+    """麦克风 -> 一帧一帧的 int16 bytes"""
+    import sounddevice as sd
+    q = queue.Queue()
+
+    def callback(indata, frames, t, status):
+        q.put(bytes(indata))
+
+    with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=frame_samples,
+                           dtype="int16", channels=1,
+                           device=cfg.get("mic_device"), callback=callback):
+        while True:
+            yield q.get()
+
+
+def file_frames(path, frame_samples):
+    """wav 文件 -> 一帧一帧 (测试用, 文件必须是 16kHz 单声道 16bit), 结尾补 3 秒安静"""
+    import wave
+    with wave.open(str(path), "rb") as w:
+        if w.getframerate() != SAMPLE_RATE or w.getnchannels() != 1 or w.getsampwidth() != 2:
+            sys.exit("测试文件必须是 16kHz、单声道、16bit 的 wav")
+        data = w.readframes(w.getnframes())
+    data += b"\0" * (SAMPLE_RATE * 2 * 3)
+    step = frame_samples * 2
+    for i in range(0, len(data) - step + 1, step):
+        yield data[i:i + step]
+
+
+def speech_events(cfg, frames_from=None):
+    """
+    持续从麦克风读音频, 用 VAD 切句。产生三种事件:
+      ("start", None)   开始说话了
+      ("end", pcm)      一句说完, pcm 是 int16 bytes (太短/像噪音时是 b"")
+      ("tick", None)    安静时每帧一次, 用来检查要不要发送
+    VAD 有两种: silero (默认, 神经网络) / webrtc (原来的)。
+    """
+    import collections
+    import numpy as np
+
+    engine = str(cfg.get("vad_engine", "silero")).lower()
+    silero = None
+    if engine == "silero":
+        try:
+            silero = SileroVAD()
+            print("VAD: Silero (神经网络)")
+        except Exception as e:
+            print(f"Silero VAD 加载失败 ({e}), 改用 webrtc VAD")
+            engine = "webrtc"
+    if engine != "silero":
+        import webrtcvad
+        vad = webrtcvad.Vad(int(cfg["vad_aggressiveness"]))
+        print("VAD: webrtc")
+    frame_samples = SileroVAD.FRAME if silero else FRAME_SAMPLES
+    frame_ms = frame_samples * 1000 / SAMPLE_RATE  # silero 32ms, webrtc 30ms
+
+    thr = float(cfg.get("silero_threshold", 0.5))
+    neg_thr = float(cfg.get("silero_neg_threshold", 0.35))
+    start_need = max(1, int(cfg.get("silero_start_frames", 3))) if silero else 1
+
+    # 音量门限: 背景(音乐/风扇)的音量会被慢慢学到, 只有明显比背景大声的人声才算
+    energy_ratio = float(cfg.get("energy_ratio", 2.5))
+    min_rms = float(cfg.get("min_rms", 300))
+    noise = min_rms
+
+    silence_frames_end = int(cfg["silence_end_ms"] / frame_ms)
+    min_frames = int(cfg["min_speech_ms"] / frame_ms)
+    max_frames = int(cfg["max_speech_s"] * 1000 / frame_ms)
+    min_run = int(cfg.get("min_continuous_ms", 240) / frame_ms)
+    pre_roll = int(300 / frame_ms)  # 句子开头多留 300ms, 免得吃掉第一个字
+
+    frames = frames_from(frame_samples) if frames_from else mic_frames(cfg, frame_samples)
+    yield ("info", frame_ms)
+    history = collections.deque(maxlen=pre_roll + start_need)
+    voiced = []
+    in_speech = False
+    silence = 0
+    speech_count = 0
+    pre_voiced = 0    # 还没开口时, 连续有声帧数
+    run_len = 0       # 当前连续人声帧数
+    best_run = 0      # 这句里最长的连续人声
+    for frame in frames:
+        if len(frame) != frame_samples * 2:
+            continue
+        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        rms = float(np.sqrt(np.mean(samples * samples)))
+        loud = rms > max(min_rms, noise * energy_ratio)
+        if silero:
+            p = silero.prob(samples / 32768.0)  # 每帧都要喂, 模型要连续的"记忆"
+            is_speech = loud and p >= (neg_thr if in_speech else thr)
+        else:
+            is_speech = loud and vad.is_speech(frame, SAMPLE_RATE)
+        # 更新背景音量: 平时慢慢跟上(约 15 秒), 变安静时快速降下来
+        if rms < noise:
+            noise = 0.9 * noise + 0.1 * rms
+        else:
+            noise = 0.998 * noise + 0.002 * rms
+        noise = max(noise, min_rms / energy_ratio)
+        if not in_speech:
+            history.append(frame)
+            pre_voiced = pre_voiced + 1 if is_speech else 0
+            if pre_voiced >= start_need:
+                in_speech = True
+                voiced = list(history)
+                history.clear()
+                silence = 0
+                speech_count = run_len = best_run = pre_voiced
+                pre_voiced = 0
+                yield ("start", None)
+            else:
+                yield ("tick", None)
+        else:
+            voiced.append(frame)
+            if is_speech:
+                silence = 0
+                speech_count += 1
+                run_len += 1
+                best_run = max(best_run, run_len)
+            else:
+                silence += 1
+                run_len = 0
+            if silence >= silence_frames_end or len(voiced) >= max_frames:
+                # 敲键盘是一下一下很短的"咔", 人说话会有连续一段人声
+                ok = speech_count >= min_frames and best_run >= min_run
+                pcm = b"".join(voiced) if ok else b""
+                yield ("end", pcm)
+                in_speech = False
+                history.clear()
+                voiced = []
+
+
+def run(cfg, dry_run=False, test_file=None):
+    import numpy as np
+    from faster_whisper import WhisperModel
+
+    if test_file:
+        dry_run = True  # 用文件测试时一定不真的发送
+        print(f"测试文件: {test_file} (只打印, 不发送)")
+    else:
+        check_mic(cfg)
+    print(f"加载 Whisper 模型 {cfg['model_size']} (第一次会下载, 请等待)...")
+    model = WhisperModel(cfg["model_size"], device=cfg["device"],
+                         compute_type=cfg["compute_type"])
+    # 提示词只用来引导简体中文。不要放唤醒词: 放了以后 Whisper 听到噪音也容易"脑补"出 fafa
+    prompt = "以下是普通话的句子。"
+    delay = float(cfg.get("send_delay_s", 2))
+    words = cfg["wake_words"]
+    mode = str(cfg.get("trigger_mode", "prefix")).lower()
+    if mode not in ("prefix", "suffix", "both"):
+        mode = "prefix"
+    buf_max = float(cfg.get("buffer_max_s", 60))
+    buf_gap = float(cfg.get("buffer_gap_s", 8))
+    mode_name = {"prefix": "先说发发再说指令", "suffix": "先说话, 最后说发发发送",
+                 "both": "两种都行"}[mode]
+    print(f"开始监听。唤醒词: {words}   触发方式: {mode} ({mode_name})   Ctrl+C 退出")
+
+    # 时钟: 正常用真实时间; 用文件测试时按"读了多少帧"算时间, 这样 2 秒延迟也能测
+    sim = {"t": 0.0, "step": 0.03}
+
+    def clock():
+        return sim["t"] if test_file else time.time()
+
+    waiting_until = 0.0   # 只说了唤醒词时, 在这个时间之前的下一句当指令
+    pending = []          # 已识别、还没发送的指令片段
+    pending_suffix = False  # True = 这条是"结尾说发发"触发的, 等待期间的新话不合并进来
+    send_at = None        # 到这个时间还没再说话, 就发送; None = 正在说话, 先不发
+    buf = []              # suffix 模式: 还没发的话 [(开口时间, 说完时间, 文字)], 只在内存里
+
+    last_sent = {"text": "", "at": 0.0}
+    clip_baseline = read_clipboard()[2]  # 启动时剪贴板里已有的东西不算"新复制"
+    watch = ClipWatch()
+    window = float(cfg.get("attach_window_s", 10))
+    last_start = clock()   # 最近一次开口的时间
+    cmd_start = clock()    # 这条指令开始说的时间
+
+    def prune_buf(t_start):
+        """丢掉太旧的; 跟上一句隔太久就整个清空 (说明是另一件事了)"""
+        if buf and t_start - buf[-1][1] > buf_gap:
+            print(f"  [缓冲] 停顿超过 {buf_gap:g} 秒, 清空前面攒的 {len(buf)} 句")
+            buf.clear()
+        while buf and clock() - buf[0][1] > buf_max:
+            buf.pop(0)
+
+    def add_buf(text, t_start):
+        if text:
+            prune_buf(t_start)
+            buf.append((t_start, clock(), text))
+            print(f"  [缓冲] 已攒 {len(buf)} 句, 说「发发」就发送")
+
+    def flush():
+        nonlocal pending, send_at, clip_baseline, pending_suffix
+        text = "，".join(pending)
+        pending, send_at, pending_suffix = [], None, False
+        t = clock()
+        watch.poll(t)
+        ok, ago = watch.recent(cmd_start, window)
+        full, image = with_clipboard(cfg, text, clip_baseline, ok, ago)
+        if image is not None:
+            import hashlib
+            dedup_key = normalize(full) + hashlib.md5(image.tobytes()).hexdigest()
+        else:
+            dedup_key = normalize(full)
+        if dedup_key == last_sent["text"] and t - last_sent["at"] < cfg.get("dedup_s", 10):
+            print(f"  和刚才发的一样, 不重复发送: {text}")
+            return
+        last_sent["text"], last_sent["at"] = dedup_key, t
+        send_text(cfg, full, image, dry_run)
+        clip_baseline = read_clipboard()[2]  # 附带过的内容下次不再附带
+        watch.consume()
+
+    def start_pending(piece, start, suffix):
+        nonlocal pending, cmd_start, send_at, pending_suffix
+        if len(normalize(piece)) < cfg.get("min_command_chars", 2):
+            print("  指令太短, 忽略")
+            return
+        pending = [piece]
+        pending_suffix = suffix
+        cmd_start = start
+        send_at = clock() + delay
+        print(f"  {delay:g} 秒内没再说话就发送...")
+
+    frames_from = (lambda n: file_frames(test_file, n)) if test_file else None
+    for kind, pcm in speech_events(cfg, frames_from):
+        if kind == "info":       # speech_events 告诉我们一帧多长
+            sim["step"] = pcm / 1000
+            continue
+        sim["t"] += sim["step"]
+        now = clock()
+        watch.poll(now)
+
+        if kind == "tick":
+            if pending and send_at is not None and now >= send_at:
+                flush()
+            continue
+
+        if kind == "start":
+            last_start = now
+            if pending and not pending_suffix:
+                send_at = None  # 她又开口了, 先别发
+            continue
+
+        # kind == "end": 一句说完
+        text = ""
+        if pcm:
+            audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            segs, _ = model.transcribe(audio, language=cfg["language"],
+                                       initial_prompt=prompt, beam_size=5,
+                                       vad_filter=False,
+                                       condition_on_previous_text=False)
+            kept = []
+            for sg in segs:
+                # 置信度低 / 很可能不是人声的片段丢掉 (键盘声、咳嗽等)
+                if (sg.no_speech_prob > cfg.get("no_speech_prob_max", 0.5)
+                        or sg.avg_logprob < cfg.get("avg_logprob_min", -1.0)):
+                    print(f"  [丢弃, 不像人声] {sg.text.strip()}  "
+                          f"(no_speech={sg.no_speech_prob:.2f}, logprob={sg.avg_logprob:.2f})")
+                    continue
+                kept.append(sg.text)
+            text = "".join(kept).strip()
+        now = clock()
+        if text:
+            print(f"[听到] {text}")
+            log_speech(cfg, text)
+
+        if pending:
+            if pending_suffix:
+                # 已经说了结尾的发发, 等待发送期间的新话留到下一轮, 不改发送时间
+                if text:
+                    w = find_wake(text, words)
+                    add_buf(" ".join(x for x in w if x) if w else text, last_start)
+                continue
+            # 等待发送期间又说了话: 合并进同一条指令, 重新计时
+            if text:
+                cmd = find_command(text, words)
+                piece = cmd if cmd else (text if cmd is None else "")
+                if piece:
+                    pending.append(piece)
+                    print(f"  合并: {'，'.join(pending)}")
+            send_at = now + delay
+            continue
+
+        if not text:
+            continue
+
+        wake = find_wake(text, words)
+        if now < waiting_until:
+            # 刚才只说了发发, 这一句就是指令
+            if wake is not None and not wake[0] and not wake[1]:
+                waiting_until = now + cfg["wait_command_s"]  # 又只说了唤醒词, 继续等
+                continue
+            waiting_until = 0.0
+            start_pending(wake[1] if wake and wake[1] else text, last_start, False)
+            continue
+
+        if mode == "prefix":
+            if wake is None:
+                continue
+            if not wake[1]:
+                waiting_until = now + cfg["wait_command_s"]
+                print(f"  唤醒了, 请在 {cfg['wait_command_s']} 秒内说指令...")
+                continue
+            start_pending(wake[1], last_start, False)
+            continue
+
+        # suffix / both: 先攒着, 听到发发再发
+        prune_buf(last_start)
+        if wake is None:
+            add_buf(text, last_start)
+            continue
+        before, after = wake
+        if mode == "both" and not before and (after or not buf):
+            # 发发在最前面 -> 按原来的方式: 发发后面的话就是指令
+            if buf:
+                print(f"  [缓冲] 发发在句首, 当作新指令, 丢掉前面攒的 {len(buf)} 句")
+                buf.clear()
+            if after:
+                start_pending(after, last_start, False)
+            else:
+                waiting_until = now + cfg["wait_command_s"]
+                print(f"  唤醒了, 请在 {cfg['wait_command_s']} 秒内说指令...")
+            continue
+        parts = [t for _, _, t in buf] + ([before] if before else [])
+        first = buf[0][0] if buf else last_start
+        buf.clear()
+        if after:  # 发发后面还有话, 留给下一轮
+            add_buf(after, last_start)
+        if not parts:
+            print("  说了发发, 但前面没有攒下的话")
+            continue
+        print(f"  结尾唤醒: 把前面 {len(parts)} 段话合成一条")
+        start_pending("，".join(parts), first, True)
+
+    if test_file and pending:  # 文件读完了还没到发送时间, 直接发
+        flush()
+
+
+LOG_PATH = Path(__file__).with_name("voice-trigger.log")
+
+
+def setup_log():
+    """后台运行(pythonw)没有窗口, 把输出写进 voice-trigger.log; 超过 5MB 就清空重来。"""
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 5 * 1024 * 1024:
+            LOG_PATH.unlink()
+    except OSError:
+        pass
+    f = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = f
+    print(f"\n===== 启动 {time.strftime('%Y-%m-%d %H:%M:%S')} =====")
+
+
+def single_instance():
+    """防止开了两个(比如开机自启了, 又手动双击一次)。"""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    k = ctypes.windll.kernel32
+    single_instance.handle = k.CreateMutexW(None, False, "voice-trigger-fafa")
+    return k.GetLastError() != 183  # 183 = 已经存在
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--calibrate", action="store_true", help="记录输入框坐标")
+    ap.add_argument("--list-mics", "--list-devices", action="store_true", help="列出麦克风")
+    ap.add_argument("--dry-run", action="store_true", help="只打印不发送")
+    ap.add_argument("--log", action="store_true", help="输出写到 voice-trigger.log (后台运行用)")
+    ap.add_argument("--test-file", help="用 16kHz 单声道 wav 代替麦克风测试 (只打印不发送)")
+    ap.add_argument("--mode", choices=["prefix", "suffix", "both"], help="临时指定触发方式")
+    ap.add_argument("--vad", choices=["silero", "webrtc"], help="临时指定 VAD")
+    args = ap.parse_args()
+    if args.log or sys.stdout is None:
+        setup_log()
+
+    cfg = load_config()
+    if args.mode:
+        cfg["trigger_mode"] = args.mode
+    if args.vad:
+        cfg["vad_engine"] = args.vad
+    if args.list_mics:
+        list_mics()
+    elif args.calibrate:
+        calibrate(cfg)
+    elif args.test_file:
+        run(cfg, True, args.test_file)  # 测试不占"只能开一个"的名额
+    else:
+        if not single_instance():
+            print("已经有一个 voice-trigger 在运行了, 这个退出。")
+            return
+        try:
+            run(cfg, args.dry_run)
+        except KeyboardInterrupt:
+            print("\n已退出")
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            raise
+
+
+if __name__ == "__main__":
+    main()
