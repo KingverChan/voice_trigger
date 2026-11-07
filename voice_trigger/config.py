@@ -65,6 +65,9 @@ DEFAULT_CONFIG = {
     # 用 python main.py --mark-target 标记当前前台窗口; 结构见 voice_trigger/target.py。
     # 激活失败时用 --calibrate 标定的 click_rel_x/click_rel_y 点一下输入框兜底。
     "target_window": None,
+    # 激活窗口只保证窗口在前台, 不保证输入框有焦点 (Electron 里焦点停在上次点的地方)。
+    # 开: 标定过点击点的话, 激活成功后也先点一下输入框再粘贴。 关: 只靠激活后的焦点。
+    "click_before_paste": True,
     # 说话时带上选中文字: 发送前在你正在用的窗口按一下 Ctrl+C 读选中的内容, 读完还原剪贴板
     "attach_selection": False,
     "selection_max_chars": 6000,

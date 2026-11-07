@@ -157,6 +157,34 @@ class SendPaths(unittest.TestCase):
         printed = " ".join(str(a) for c in p.call_args_list for a in c.args)
         self.assertIn("未校验", printed)
 
+    def test_activated_also_clicks_input_if_calibrated(self):
+        target = dict(TARGET, click_rel_x=20, click_rel_y=30)
+        with FakeModules() as f, \
+                mock.patch.object(paste, "find_target_window", return_value=4321), \
+                mock.patch.object(paste, "window_info", return_value=("Claude", "claude.exe")), \
+                mock.patch.object(paste, "activate_window", return_value=True), \
+                mock.patch.object(paste, "click_point", return_value=(120, 230)), \
+                mock.patch.object(paste, "window_at_point", return_value=4321), \
+                mock.patch.object(paste, "is_foreground", return_value=True), \
+                no_print():
+            ok = paste.send_text(cfg_with(target), "你好")
+        self.assertTrue(ok)
+        self.assertIn(("click", 120, 230), f.gui.calls)
+        self.assertIn(("hotkey", "ctrl", "v"), f.gui.calls)
+
+    def test_click_before_paste_off_means_no_click(self):
+        target = dict(TARGET, click_rel_x=20, click_rel_y=30)
+        with FakeModules() as f, \
+                mock.patch.object(paste, "find_target_window", return_value=4321), \
+                mock.patch.object(paste, "window_info", return_value=("Claude", "claude.exe")), \
+                mock.patch.object(paste, "activate_window", return_value=True), \
+                mock.patch.object(paste, "click_point") as click_point, \
+                no_print():
+            ok = paste.send_text(cfg_with(target, click_before_paste=False), "你好")
+        self.assertTrue(ok)
+        click_point.assert_not_called()
+        self.assertIn(("hotkey", "ctrl", "v"), f.gui.calls)
+
     def test_fallback_aborts_when_point_covered(self):
         target = dict(TARGET, click_rel_x=20, click_rel_y=30)
         with FakeModules() as f, \

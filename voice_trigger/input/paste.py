@@ -97,6 +97,9 @@ def send_text(cfg, text, image=None, dry_run=False):
     point = None
     if activate_window(hwnd):
         print(f"  已激活「{title}」({exe})")
+        # 激活只保证窗口在前台, 不保证输入框有焦点; 标定过就顺手点一下输入框
+        if target.get("click_rel_x") is not None and cfg.get("click_before_paste", True):
+            point = click_point(target, hwnd)
     else:
         point = click_point(target, hwnd)
         if not point:
