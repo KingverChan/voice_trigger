@@ -147,6 +147,8 @@ class SendPaths(unittest.TestCase):
                 mock.patch.object(paste, "window_info", return_value=("Claude", "claude.exe")), \
                 mock.patch.object(paste, "activate_window", return_value=False), \
                 mock.patch.object(paste, "click_point", return_value=(120, 230)), \
+                mock.patch.object(paste, "window_at_point", return_value=4321), \
+                mock.patch.object(paste, "is_foreground", return_value=True), \
                 no_print() as p:
             ok = paste.send_text(cfg_with(target), "你好")
         self.assertTrue(ok)
@@ -154,6 +156,21 @@ class SendPaths(unittest.TestCase):
         self.assertIn(("hotkey", "ctrl", "v"), f.gui.calls)
         printed = " ".join(str(a) for c in p.call_args_list for a in c.args)
         self.assertIn("未校验", printed)
+
+    def test_fallback_aborts_when_point_covered(self):
+        target = dict(TARGET, click_rel_x=20, click_rel_y=30)
+        with FakeModules() as f, \
+                mock.patch.object(paste, "find_target_window", return_value=4321), \
+                mock.patch.object(paste, "window_info", return_value=("Claude", "claude.exe")), \
+                mock.patch.object(paste, "activate_window", return_value=False), \
+                mock.patch.object(paste, "click_point", return_value=(120, 230)), \
+                mock.patch.object(paste, "window_at_point", return_value=9999), \
+                no_print() as p:
+            ok = paste.send_text(cfg_with(target), "你好")
+        self.assertFalse(ok)
+        self.assertEqual([c for c in f.gui.calls if c[0] in ("click", "hotkey", "press")], [])
+        printed = " ".join(str(a) for c in p.call_args_list for a in c.args)
+        self.assertIn("盖住", printed)
 
     def test_image_is_a_second_message(self):
         image = Image.new("RGB", (2, 2))

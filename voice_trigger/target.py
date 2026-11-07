@@ -276,6 +276,21 @@ def calibrate_click(cfg, x, y):
                   f"-> {CONFIG_PATH.name}")
 
 
+def window_at_point(x, y):
+    """屏幕坐标 (x, y) 上最上层的顶层窗口句柄; 读不到返回 0。"""
+    try:
+        ctypes, wintypes, u, _ = _win32()
+        u.WindowFromPoint.argtypes = [wintypes.POINT]
+        u.WindowFromPoint.restype = wintypes.HWND
+        h = _hwnd(u.WindowFromPoint(wintypes.POINT(int(x), int(y))))
+        if not h:
+            return 0
+        root = _hwnd(u.GetAncestor(h, GA_ROOT))
+        return root or h
+    except Exception:
+        return 0
+
+
 def click_point(target, hwnd):
     """兜底点击点在当前屏幕上的坐标; 没标定或窗口没了返回 None。"""
     if not target or target.get("click_rel_x") is None or target.get("click_rel_y") is None:

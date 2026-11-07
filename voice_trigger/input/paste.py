@@ -9,7 +9,7 @@ import time
 
 from ..journal import mark_pasting
 from ..target import (activate_window, click_point, describe_target,
-                      find_target_window)
+                      find_target_window, is_foreground, window_at_point)
 from ..windows import foreground_window, match_words, window_info
 from .clipboard import read_clipboard, set_clipboard_image
 
@@ -123,8 +123,17 @@ def send_text(cfg, text, image=None, dry_run=False):
     ok = False
     try:
         if point is not None:
+            # 兜底点击前先确认那个点上还是标记窗口, 别点到盖在上面的面板/别的程序
+            cover = window_at_point(point[0], point[1])
+            if cover != int(hwnd):
+                print(f"  兜底点击点被别的窗口盖住了 (那个位置现在是句柄 {cover or '空'}), 取消发送")
+                print("  把挡住的窗口挪开, 或重新 --calibrate 标定点击点")
+                return False
             pyautogui.click(point[0], point[1])
             time.sleep(0.2)
+            if not is_foreground(hwnd):
+                print("  点了之后前台还不是标记窗口, 取消发送 (没粘贴)")
+                return False
         enter = bool(cfg.get("press_enter", True))
         if text:
             # 3. 文字: 剪贴板设文本 -> Ctrl+V -> 等 300ms -> Enter
