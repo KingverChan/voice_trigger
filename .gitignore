@@ -2,3 +2,13 @@
 __pycache__/
 config.json
 voice-trigger.log
+.idea/
+*.bak
+patches/
+main_new_test.py.old*
+ai_filter_usage.json
+models/
+tts_cache/
+*.wav
+*.mp3
+voice-trigger.log
