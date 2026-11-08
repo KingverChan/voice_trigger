@@ -83,7 +83,7 @@ DEFAULT_CONFIG = {
     # 念回复时按这些关键词找 AI 窗口 (只是读窗口文字用, 跟发到哪里无关)
     "reply_window_words": ["claude", "豆包", "deepseek", "chatgpt"],
     "ai_context_max_s": 120,        # 上次发给 AI 超过 120 秒就不带了
-    "ai_context_read_reply": True,
+    "ai_context_read_reply": False,  # UIA 读窗口在终端场景容易读错窗口, 默认关 (聊天窗口可手动开)
     "ai_context_reply_chars": 800,  # AI 回复只取最后 800 字, 只发给 DeepSeek, 不写日志
     # 念出 AI 回复 (edge-tts, 要联网): 发给 AI 后等回复出现并稳定 2 秒, 念最新一条
     "tts": False,

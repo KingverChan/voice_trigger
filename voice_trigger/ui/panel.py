@@ -91,9 +91,12 @@ def already_open():
         if k.GetLastError() != 183:   # 183 = 已经存在
             return False
         u = ctypes.windll.user32
+        u.IsIconic.argtypes = [ctypes.c_void_p]
+        u.IsIconic.restype = ctypes.c_int
         h = u.FindWindowW(None, "发发 · 语音唤醒")
         if h:
-            u.ShowWindow(h, 9)            # SW_RESTORE (最小化了也恢复)
+            if u.IsIconic(h):
+                u.ShowWindow(h, 9)        # 只有最小化才恢复; 最大化时 SW_RESTORE 会取消最大化
             u.keybd_event(0x12, 0, 0, 0)  # 按一下 Alt, Windows 才允许把别的窗口拿到前台
             u.SetForegroundWindow(h)
             u.keybd_event(0x12, 0, 2, 0)

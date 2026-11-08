@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """常驻主循环: 听音 -> 识别 -> 唤醒词 -> 发送; 以及 bench 和单实例检查。"""
+import os
 import sys
 import time
 
@@ -8,6 +9,7 @@ from .asr import load_whisper
 from .audio.gpu import add_nvidia_dlls
 from .audio.mic import check_mic, file_frames, mic_users
 from .audio.vad import speech_events
+from .config import CONFIG_PATH, load_config
 from .constants import SAMPLE_RATE
 from .input.autoflag import auto_on, set_auto
 from .input.clipboard import ClipWatch, read_clipboard, with_clipboard
@@ -18,6 +20,35 @@ from .paths import BENCH_WAV, TTS_CMD
 from .reply import watch_reply, watch_reply_file
 from .tts import Speaker, tts_enabled
 from .wake import find_command, find_wake, normalize
+
+
+def reload_target_config(cfg, rt):
+    """config.json 变了就只热加载发送目标相关字段, 其余配置不热应用。
+
+    用户在另一个进程里跑 --mark-target / --calibrate, 写的是同一个 config.json;
+    常驻服务不用重启 (更不用重载 Whisper), 几秒内自动用上新标记。
+    """
+    try:
+        mtime = os.stat(CONFIG_PATH).st_mtime_ns
+    except OSError:
+        return
+    if rt.get("config_mtime") is None:   # 第一次: 只记基线
+        rt["config_mtime"] = mtime
+        return
+    if mtime == rt["config_mtime"]:
+        return
+    try:
+        fresh = load_config()
+    except Exception as e:
+        print(f"[目标] 配置读取失败, 下次再试: {e}")
+        return
+    rt["config_mtime"] = mtime
+    # click_rel_x / click_rel_y 在 target_window 里面, 更新 target_window 就一起带过来
+    for key in ("target_window", "click_rel_x", "click_rel_y", "click_before_paste"):
+        if key in fresh:
+            cfg[key] = fresh[key]
+    print("[目标] 检测到配置变化, 已热加载标记窗口")
+
 
 def bench(cfg):
     """用 bench.wav (约 15 秒, 3 句话) 测速度: 每种组合先热身一次, 再计时一次。"""
@@ -163,7 +194,13 @@ def run(cfg, dry_run=False, test_file=None):
         print(f"  {delay:g} 秒内没再说话就发送...")
 
     frames_from = (lambda n: file_frames(test_file, n)) if test_file else None
-    rt = {"auto": auto_on() or mode == "auto", "checked": 0.0, "call": "", "call_checked": 0.0}
+    try:
+        config_mtime = os.stat(CONFIG_PATH).st_mtime_ns
+    except OSError:
+        config_mtime = None
+    rt = {"auto": auto_on() or mode == "auto", "checked": 0.0, "call": "",
+          "call_checked": 0.0, "config_checked": 0.0,
+          "config_mtime": config_mtime}
     recent = []   # 最近听到的几句, 给 AI 判断当上下文
     ai_filter = bool(cfg.get("ai_filter"))
     call_apps = [a.lower() for a in cfg.get("call_apps", [])]
@@ -285,6 +322,9 @@ def run(cfg, dry_run=False, test_file=None):
                     speaker.repeat()
                 elif c == "stop":
                     speaker.stop()
+            if now - rt["config_checked"] > 2:  # 每 2 秒看一眼标记有没有更新
+                rt["config_checked"] = now
+                reload_target_config(cfg, rt)
             a = auto_on() and not rt["call"]
             if a != rt["auto"]:
                 rt["auto"] = a

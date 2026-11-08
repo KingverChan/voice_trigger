@@ -57,7 +57,7 @@ def ai_is_for_ai(cfg, text, context, last_ai=None):
         if ago <= float(cfg.get("ai_context_max_s", 120)):
             extra = f"她 {ago:.0f} 秒前刚对 AI 说了: {last_ai['text'][:300]}\n"
             note = f"带上 {ago:.0f} 秒前发给 AI 的话"
-            if cfg.get("ai_context_read_reply", True):
+            if cfg.get("ai_context_read_reply", False):
                 try:
                     reply, why = read_ai_reply(cfg, int(cfg.get("ai_context_reply_chars", 800)))
                 except Exception as e:

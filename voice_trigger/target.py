@@ -45,6 +45,8 @@ def _win32():
     u.IsWindowVisible.restype = wintypes.BOOL
     u.IsWindow.argtypes = [wintypes.HWND]
     u.IsWindow.restype = wintypes.BOOL
+    u.IsIconic.argtypes = [wintypes.HWND]
+    u.IsIconic.restype = wintypes.BOOL
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     u.ShowWindow.restype = wintypes.BOOL
     u.SetForegroundWindow.argtypes = [wintypes.HWND]
@@ -114,32 +116,51 @@ def list_windows():
     return out
 
 
+def _is_window(hwnd):
+    """这个句柄现在还是不是一个存在的窗口。"""
+    try:
+        _, _, u, _ = _win32()
+        return bool(u.IsWindow(_hwnd(hwnd)))
+    except Exception:
+        return False
+
+
 def find_target_window(target):
     """
-    按 target_window 里的 exe + 标题子串重新找窗口 (窗口关了再开、hwnd 变了也能找到)。
-    找不到返回 None。标题变了但程序只有一个窗口时, 仍然用它。
+    按 target_window 找窗口, 三级回退:
+    1. exe + 标题子串匹配 (标题会随终端里跑的对话变化, 所以先按标记时的标题找)
+    2. 标题没命中时, 标记时的 hwnd 还活着 (IsWindow) 就用它
+    3. 还不行就取同 exe 最后一个可见顶层窗口 (EnumWindows 顺序, 通常是最新开的)
+    找不到返回 None。每级命中都打日志说明走的哪一级。
     """
     if not target:
         return None
     exe = (target.get("exe") or "").strip().lower()
     sub = (target.get("title_substr") or "").strip().lower()
     old = _hwnd(target.get("hwnd"))
-    wins = list_windows()
-    cands = [w for w in wins if not exe or w[2].strip().lower() == exe]
-    if not cands:
-        return None
-    if sub:
-        hit = [w for w in cands if sub in w[1].lower()]
-        if hit:
-            cands = hit
-        elif exe and len(cands) == 1:
-            cands = cands  # 标题变了 (浏览器换标签页等), 程序只有一个窗口就用它
-        else:
-            return None
-    for h, _, _ in cands:
-        if h == old:
-            return h
-    return cands[0][0]
+    same_exe = [w for w in list_windows()
+                if not exe or w[2].strip().lower() == exe]
+
+    # 1. exe + 标题子串
+    hit = [w for w in same_exe if not sub or sub in w[1].lower()]
+    if hit:
+        print("[目标] 标题匹配")
+        for h, _, _ in hit:
+            if h == old:
+                return h
+        return hit[0][0]
+
+    # 2. 标题失配: 标记时的句柄还活着就用它 (窗口没关, 只是标题变了)
+    if old and _is_window(old):
+        print("[目标] 标题失配, 用标记句柄")
+        return old
+
+    # 3. 还没有: 取同 exe 最后一个可见窗口 (通常是最新打开的那个)
+    if exe and same_exe:
+        print("[目标] 标题失配, 回退同 exe 窗口")
+        return same_exe[-1][0]
+
+    return None
 
 
 def is_foreground(hwnd):
@@ -160,7 +181,7 @@ def is_foreground(hwnd):
 
 def activate_window(hwnd, tries=10, interval=0.1):
     """
-    把窗口恢复并切到前台, 然后轮询 GetForegroundWindow 确认 (10 次 x 100ms)。
+    把窗口切到前台 (最小化了才恢复), 然后轮询 GetForegroundWindow 确认 (10 次 x 100ms)。
     返回 True = 已确认在前台; False = 没切过去 (调用方走兜底点击)。
     """
     try:
@@ -168,7 +189,10 @@ def activate_window(hwnd, tries=10, interval=0.1):
         hwnd = _hwnd(hwnd)
         if not hwnd or not u.IsWindow(hwnd):
             return False
-        u.ShowWindow(hwnd, SW_RESTORE)
+        if u.IsIconic(hwnd):
+            # 只有最小化才恢复。SW_RESTORE 对最大化窗口等于取消最大化 (窗口会被缩回普通尺寸),
+            # 所以最大化/普通状态一律不动, 交给 SetForegroundWindow 切前台。
+            u.ShowWindow(hwnd, SW_RESTORE)
         # 先松/按一下 Alt, Windows 才允许把别的窗口抢到前台
         u.keybd_event(0x12, 0, 0, None)
         ok = bool(u.SetForegroundWindow(hwnd))
