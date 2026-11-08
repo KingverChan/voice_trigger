@@ -9,8 +9,9 @@ import time
 
 from ..journal import mark_pasting
 from ..target import (activate_window, click_point, describe_target,
-                      find_target_window, is_foreground, window_at_point)
-from ..windows import foreground_window, match_words, window_info
+                      find_target_window, foreground_hwnd, is_foreground,
+                      is_window, is_window_visible, window_at_point)
+from ..windows import match_words, window_info
 from .clipboard import read_clipboard, set_clipboard_image
 
 
@@ -18,13 +19,19 @@ def read_selection(cfg):
     """
     读你在前台窗口里选中(框选)的文字: 模拟按一下 Ctrl+C, 读剪贴板, 再把原来的剪贴板放回去。
     没选中东西时剪贴板不会变, 返回 ""。只在发送的那一刻读一次, 不会在后台一直读。
+    前台窗口不可见 / 是工具自身 (pythonw.exe) / 是 Ctrl+C 会中断程序的应用时, 不读。
     """
+    hwnd = foreground_hwnd()
+    if not hwnd or not is_window_visible(hwnd):
+        return "", "前台窗口不可见, 不读"
+    _, exe = window_info(hwnd)
+    if exe.strip().lower() in ("python.exe", "pythonw.exe"):
+        return "", "前台是工具自身进程, 不读"
+    if match_words(cfg.get("selection_skip_apps", []), exe):
+        return "", f"{exe} 里按 Ctrl+C 会中断程序, 不读"
     import ctypes
     import pyautogui
     import pyperclip
-    title, exe = foreground_window()
-    if match_words(cfg.get("selection_skip_apps", []), exe):
-        return "", f"{exe} 里按 Ctrl+C 会中断程序, 不读"
     seq = ctypes.windll.user32.GetClipboardSequenceNumber
     old_text, old_img, _ = read_clipboard()
     before = seq()
@@ -67,52 +74,71 @@ def send_text(cfg, text, image=None, dry_run=False):
     确认不了输入框里真的收到了, 所以打印的是「已粘贴并回车 (未校验)」。
     """
     target = cfg.get("target_window")
+    auto = cfg.get("auto_target_window")
     if dry_run:
-        print(f"  [dry-run] 目标窗口: {describe_target(target)}")
+        if auto:
+            print(f"  [dry-run] 目标窗口: 自动跟随的终端 ({auto.get('exe')}, hwnd={auto.get('hwnd')})")
+        else:
+            print(f"  [dry-run] 目标窗口: {describe_target(target)}")
         if text:
             print(f"  [dry-run] 会粘贴文字并回车: {text}")
         if image is not None:
             print(f"  [dry-run] 图片会单独作为第二条消息发: {image.size[0]}x{image.size[1]}")
         if not text and image is None:
             print("  [dry-run] 没有要发送的内容")
-        if not target:
-            print("  [dry-run] 注意: 还没标记目标窗口, 正式发送会失败 (先 --mark-target)")
+        if not auto and not target:
+            print("  [dry-run] 注意: 还没有发送目标, 正式发送会失败 (点一下终端, 或先 --mark-target)")
         return True
 
-    if not target:
-        print("  还没标记目标窗口, 先运行: python main.py --mark-target")
-        return False
     if not text and image is None:
         print("  没有要发送的内容")
         return False
 
-    # 1. 按 exe + 标题重新找窗口 (窗口重开、hwnd 变了也能找到)
-    hwnd = find_target_window(target)
-    if not hwnd:
-        print("  标记的窗口不见了, 请重新运行: python main.py --mark-target")
-        return False
+    # 1. 优先用最近点击的终端; 自动目标没了 (或为空) 就回退 --mark-target 标记的窗口
+    hwnd = None
+    use_config_target = False
+    if auto:
+        h = int(auto.get("hwnd") or 0)
+        if h and is_window(h):
+            hwnd = h
+        else:
+            print("[目标] 自动跟随的终端不见了, 点击一个新终端即可")
+    if hwnd is None:
+        if not target:
+            print("  还没标记目标窗口, 先运行: python main.py --mark-target")
+            return False
+        # 按 exe + 标题重新找窗口 (窗口重开、hwnd 变了也能找到)
+        hwnd = find_target_window(target)
+        if not hwnd:
+            print("  标记的窗口不见了, 请重新运行: python main.py --mark-target")
+            return False
+        use_config_target = True
     title, exe = window_info(hwnd)
 
-    # 2. 激活 + 确认; 失败就走兜底点击
+    # 2. 激活 + 确认; 配置目标激活失败还能用标定点点一下, 自动目标没有标定
     point = None
     if activate_window(hwnd):
         print(f"  已激活「{title}」({exe})")
-        # 激活只保证窗口在前台, 不保证输入框有焦点; 标定过就顺手点一下输入框
-        has_point = (target.get("click_rel_x") is not None
-                     and target.get("click_rel_y") is not None)
-        if not has_point:
-            print("  没有标定点击点, 直接粘贴 (靠窗口焦点)")
-        elif cfg.get("click_before_paste", True):
-            point = click_point(target, hwnd)
-            if point is None:
-                print("  读不到标定点击点对应的客户区, 直接粘贴 (靠窗口焦点)")
+        if not use_config_target:
+            print("  自动跟随的终端, 直接粘贴 (靠窗口焦点)")
         else:
-            print("  click_before_paste 已关, 不点输入框, 直接粘贴")
+            # 激活只保证窗口在前台, 不保证输入框有焦点; 标定过就顺手点一下输入框
+            has_point = (target.get("click_rel_x") is not None
+                         and target.get("click_rel_y") is not None)
+            if not has_point:
+                print("  没有标定点击点, 直接粘贴 (靠窗口焦点)")
+            elif cfg.get("click_before_paste", True):
+                point = click_point(target, hwnd)
+                if point is None:
+                    print("  读不到标定点击点对应的客户区, 直接粘贴 (靠窗口焦点)")
+            else:
+                print("  click_before_paste 已关, 不点输入框, 直接粘贴")
     else:
-        point = click_point(target, hwnd)
+        point = click_point(target, hwnd) if use_config_target else None
         if not point:
             print(f"  激活「{title}」({exe}) 失败 (Windows 不让切到前台), 也没有标定兜底点击点")
-            print("  先运行: python main.py --calibrate (把鼠标移到它的输入框上)")
+            if use_config_target:
+                print("  先运行: python main.py --calibrate (把鼠标移到它的输入框上)")
             return False
         print(f"  激活「{title}」失败, 用标定的位置 {point} 点一下输入框")
 

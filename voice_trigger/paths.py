@@ -14,6 +14,7 @@ AI_USAGE = PROJECT_ROOT / "ai_filter_usage.json"
 AUTO_FLAG = PROJECT_ROOT / "AUTO_SEND_ON"
 TTS_CMD = PROJECT_ROOT / "TTS_CMD"
 TTS_DIR = PROJECT_ROOT / "tts_cache"
+SCREENSHOT_DIR = PROJECT_ROOT / "screenshot_cache"
 MODELS_DIR = PROJECT_ROOT / "models"
 BENCH_WAV = PROJECT_ROOT / "bench.wav"
 

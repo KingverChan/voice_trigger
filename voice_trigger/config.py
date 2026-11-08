@@ -74,9 +74,10 @@ DEFAULT_CONFIG = {
     # 这些程序没选中东西时按 Ctrl+C 会复制整行 (VS Code), 复制到的正好是"一整行"就当没选中
     "selection_line_copy_apps": ["code.exe", "cursor.exe", "pycharm64.exe", "pycharm.exe", "idea64.exe",
                                  "clion64.exe", "webstorm64.exe", "goland64.exe", "rider64.exe", "studio64.exe"],
-    # 这些程序里 Ctrl+C 是"中断", 不去读选中内容
+    # 这些程序里 Ctrl+C 是"中断", 不去读选中内容; python 是工具自身进程 (面板)
     "selection_skip_apps": ["windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
-                            "conhost.exe", "wt.exe", "mintty.exe", "putty.exe"],
+                            "conhost.exe", "wt.exe", "mintty.exe", "putty.exe",
+                            "pythonw.exe", "python.exe"],
     # 判断"是不是对 AI 说的"时带上对话上下文: 你上次发给 AI 的话 (和距今几秒),
     # 还会试着读 AI 窗口里最后的回复 (要装 uiautomation, 读不到就只带你自己的话)
     "ai_context": True,
@@ -119,6 +120,9 @@ DEFAULT_CONFIG = {
     "dedup_s": 10,
     "energy_ratio": 2.5,
     "min_rms": 300,
+    # 按住 Alt 说话 (通常是在用输入法语音听写, 自己想编辑这段话) 时,
+    # 自动发送不把这句话发出去; 说「发发」的明确指令不受影响
+    "alt_hold_no_autosend": True,
     "attach_clipboard": True,
     "attach_only_new": True,
     "attach_max_chars": 4000,

@@ -18,8 +18,11 @@ from .input.paste import read_selection, send_text
 from .journal import log_speech
 from .paths import BENCH_WAV, TTS_CMD
 from .reply import watch_reply, watch_reply_file
+from .target import (alt_held, foreground_hwnd, is_terminal_target,
+                     left_button_down, track_auto_target)
 from .tts import Speaker, tts_enabled
 from .wake import find_command, find_wake, normalize
+from .windows import window_info
 
 
 def reload_target_config(cfg, rt):
@@ -48,6 +51,47 @@ def reload_target_config(cfg, rt):
         if key in fresh:
             cfg[key] = fresh[key]
     print("[目标] 检测到配置变化, 已热加载标记窗口")
+
+
+def selection_repeats(sel_mem, got):
+    """选中文字和上次附带过的相同就跳过 (自动发送时别每句都重复带同一块)。"""
+    norm = normalize(got)
+    if norm == sel_mem.get("text"):
+        return True
+    sel_mem["text"] = norm
+    return False
+
+
+def take_selection_text(cfg, sel_mem):
+    """读选中文字并处理去重/截断/日志; 返回要附带的内容, "" = 不附带。"""
+    got, where = read_selection(cfg)
+    if not got.strip():
+        print(f"  [选中文字] {where}")
+        return ""
+    if selection_repeats(sel_mem, got):
+        print("[选中文字] 内容没变, 不重复附带")
+        return ""
+    limit = int(cfg.get("selection_max_chars", 6000))
+    note = ""
+    if len(got) > limit:
+        note = f", 太长只带前 {limit} 字"
+        got = got[:limit] + "\n...(选中内容太长, 已截断)"
+    print(f"  [选中文字] 从 {where} 读到 {len(got)} 字{note}")
+    return got
+
+
+def attach_text_repeats(spoken, clip):
+    """剪贴板文字是不是就是刚说的话 (输入法可能把语音文字写进剪贴板)。
+
+    归一化后相等, 或互相包含且短/长 > 0.7, 都当成重复。
+    """
+    a, b = normalize(spoken), normalize(clip)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return short in long_ and len(short) / len(long_) > 0.7
 
 
 def bench(cfg):
@@ -114,6 +158,7 @@ def run(cfg, dry_run=False, test_file=None):
 
     last_sent = {"text": "", "at": 0.0}
     last_ai = {"text": "", "at": 0.0}   # 上次发给 AI 的话 (只在内存里)
+    sel_mem = {"text": None}            # 上次附带过的选中文字 (归一化后), 防重复附带
     clip_baseline = read_clipboard()[2]  # 启动时剪贴板里已有的东西不算"新复制"
     watch = ClipWatch()
     window = float(cfg.get("attach_window_s", 10))
@@ -144,22 +189,33 @@ def run(cfg, dry_run=False, test_file=None):
         sel = ""
         if not dry_run and sys.platform == "win32" and cfg.get("attach_selection"):
             try:
-                got, where = read_selection(cfg)
+                sel = take_selection_text(cfg, sel_mem)
             except Exception as e:
-                got, where = "", f"出错: {e}"
+                print(f"  [选中文字] 出错: {e}")
             watch.ignore()  # 刚才那次 Ctrl+C 是我们按的, 不算你复制
-            if got.strip():
-                limit = int(cfg.get("selection_max_chars", 6000))
-                note = ""
-                if len(got) > limit:
-                    note = f", 太长只带前 {limit} 字"
-                    got = got[:limit] + "\n...(选中内容太长, 已截断)"
-                print(f"  [选中文字] 从 {where} 读到 {len(got)} 字{note}")
-                sel = got
-            else:
-                print(f"  [选中文字] {where}")
         ok, ago = watch.recent(cmd_start, window)
-        full, image = with_clipboard(cfg, text, clip_baseline, ok, ago)
+        during_speech = ago is not None and ago <= 0
+        if during_speech and cfg.get("attach_clipboard", True):
+            # 微信输入法等语音听写会在你说话过程中把文字写进剪贴板;
+            # 这不是你主动复制的, 不能当"附带内容"再发一遍
+            print("[附带] 复制发生在说话过程中, 不算 (输入法写的)")
+        want_attach = False
+        clip_text = ""
+        if cfg.get("attach_clipboard", True) and ok:
+            clip_text, clip_img, clip_key = read_clipboard()
+            want_attach = (clip_img is None and bool(clip_text.strip())
+                           and (not cfg.get("attach_only_new", True)
+                                or clip_key != clip_baseline))
+        if want_attach and attach_text_repeats(text, clip_text):
+            # 输入法 (尤其语音输入) 会把刚说的话写进剪贴板, 别把它当"复制内容"再附一遍
+            print("[附带] 剪贴板内容和你刚说的话重复, 不附带 (输入法写的)")
+            full, image = text, None
+        else:
+            # 说话过程中的复制已经在上面的分支处理了; 这里传 None,
+            # 免得 with_clipboard 打出"说话前 -N 秒复制的"这种误导信息
+            full, image = with_clipboard(cfg, text, clip_baseline, ok,
+                                         None if during_speech else ago,
+                                         terminal=is_terminal_target(cfg))
         if sel:
             # 选中内容放在说的话后面; 剪贴板附带的内容 (如果有) 放在最后
             head, sep, rest = full.partition("\n\n【附带的复制内容】")
@@ -200,7 +256,10 @@ def run(cfg, dry_run=False, test_file=None):
         config_mtime = None
     rt = {"auto": auto_on() or mode == "auto", "checked": 0.0, "call": "",
           "call_checked": 0.0, "config_checked": 0.0,
-          "config_mtime": config_mtime}
+          "config_mtime": config_mtime,
+          "lbutton": left_button_down() if not test_file else False,
+          "in_speech": False,      # start 到 end 之间
+          "alt_during": False}     # 这句说话期间按住过 Alt (用输入法听写, 别自动发)
     recent = []   # 最近听到的几句, 给 AI 判断当上下文
     ai_filter = bool(cfg.get("ai_filter"))
     call_apps = [a.lower() for a in cfg.get("call_apps", [])]
@@ -298,7 +357,19 @@ def run(cfg, dry_run=False, test_file=None):
             continue
         sim["t"] += sim["step"]
         now = clock()
+        if (not test_file and rt.get("in_speech")
+                and cfg.get("alt_hold_no_autosend", True)):
+            # 从 start 到 end 这一拍: 说话期间只要按住过 Alt 就记下来
+            rt["alt_during"] = rt["alt_during"] or alt_held()
         watch.poll(now)
+        if not test_file:
+            # 鼠标左键上升沿: 最近点的是终端就自动把它当发送目标 (约 30ms 一拍)
+            down = left_button_down()
+            hwnd = foreground_hwnd() if (down and not rt.get("lbutton")) else 0
+            exe = ""
+            if hwnd:
+                _, exe = window_info(hwnd)
+            track_auto_target(cfg, rt, down, hwnd, exe)
         if not test_file and cfg.get("pause_on_call") and now - rt["call_checked"] > 2:
             rt["call_checked"] = now  # 每 2 秒看一下有没有通话软件在用麦克风
             try:
@@ -339,6 +410,10 @@ def run(cfg, dry_run=False, test_file=None):
 
         if kind == "start":
             last_start = now
+            rt["in_speech"] = True
+            rt["alt_during"] = (not test_file
+                                and bool(cfg.get("alt_hold_no_autosend", True))
+                                and alt_held())
             rt["tts_drop"] = False
             if speaker.active:
                 if cfg.get("tts_barge_in", True):
@@ -351,6 +426,7 @@ def run(cfg, dry_run=False, test_file=None):
             continue
 
         # kind == "end": 一句说完
+        rt["in_speech"] = False
         text = ""
         cached = rt.pop("cached_text", None)
         if pcm and cached:
@@ -388,6 +464,12 @@ def run(cfg, dry_run=False, test_file=None):
         if rt["auto"]:
             # 自动发送: 这句话直接发到标记的窗口 (去掉里面的"发发"), 不等
             w = find_wake(text, words)
+            if (cfg.get("alt_hold_no_autosend", True) and rt.get("alt_during")
+                    and not w):
+                # 按住 Alt 多半是在用输入法语音听写, 这句话用户要自己编辑;
+                # 不发, 也不问 DeepSeek (不浪费次数), 更不攒进缓冲
+                print("[模式] 按住 Alt 说话 (自己编辑), 不自动发送")
+                continue
             piece = " ".join(x for x in w if x) if w else text
             piece = piece.strip(" ，,。.?？!！")
             if len(normalize(piece)) < cfg.get("auto_min_chars", 2):
@@ -464,10 +546,50 @@ def run(cfg, dry_run=False, test_file=None):
         flush()
 
 def single_instance():
-    """防止开了两个(比如开机自启了, 又手动双击一次)。"""
+    """防止开了两个(比如开机自启了, 又手动双击一次)。
+
+    历史日志里出现过两个实例同时监听、同一句话发两次 (每个进程各自去重,
+    互相不知道)。所以这里用两道锁:
+      1) 命名互斥量: 同一会话里最便宜, 但必须把 64 位句柄类型写清楚;
+         创建失败 (权限/会话隔离) 时不能当成"没有别的实例"。
+      2) 锁文件: 进程活着就占着, 退出时系统自动释放; 就算互斥量没拦住,
+         第二个实例也会在这里退出。
+    """
     if sys.platform != "win32":
         return True
     import ctypes
+    from ctypes import wintypes
     k = ctypes.windll.kernel32
-    single_instance.handle = k.CreateMutexW(None, False, "voice-trigger-fafa")
-    return k.GetLastError() != 183  # 183 = 已经存在
+    # 64 位系统上句柄是 64 位, 不声明类型会被截断, 所以 argtypes/restype 都写清楚
+    k.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    k.CreateMutexW.restype = wintypes.HANDLE
+    k.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k.OpenMutexW.restype = wintypes.HANDLE
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.restype = wintypes.BOOL
+    k.SetLastError.argtypes = [wintypes.DWORD]
+    k.SetLastError.restype = None
+    k.GetLastError.argtypes = []
+    k.GetLastError.restype = wintypes.DWORD
+    k.SetLastError(0)
+    h = k.CreateMutexW(None, False, "voice-trigger-fafa")
+    if not h:
+        # 创建失败: 能打开同名对象就说明已经有实例; 打不开也保守起见不启动,
+        # 免得又变成两个进程各发一遍
+        old = k.OpenMutexW(0x00100000, False, "voice-trigger-fafa")
+        if old:
+            k.CloseHandle(old)
+        return False
+    single_instance.handle = h
+    if k.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        return False
+    try:
+        import msvcrt
+        import tempfile
+        lock = open(os.path.join(tempfile.gettempdir(), "voice-trigger-fafa.lock"), "a+b")
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        single_instance.lock_file = lock   # 进程活着就一直占着这把锁
+    except OSError:
+        return False
+    return True

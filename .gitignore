@@ -15,3 +15,13 @@ voice-trigger.log
 
 # 诊断脚本输出
 tools/uia_dump.txt
+
+# 运行时产物
+claude_reply.txt
+screenshot_cache/
+tools/ga_*.py
+tools/ga_*.log
+tools/key_probe.py
+tools/key_probe.log
+tools/win_spy.py
+tools/win_spy.log

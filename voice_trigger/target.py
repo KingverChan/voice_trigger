@@ -21,6 +21,14 @@ from .windows import is_panel, window_info
 
 SW_RESTORE = 9
 GA_ROOT = 2
+VK_LBUTTON = 0x01
+VK_LMENU = 0xA4   # 左 Alt
+VK_RMENU = 0xA5   # 右 Alt
+# 最近点击这些程序时, 自动把它当成发送目标 (不用 --mark-target)
+AUTO_TARGET_EXES = ["windowsterminal.exe"]
+# 这些终端里贴不了图片: 图片附带要降级成"图片地址"文字
+TERMINAL_EXES = ["windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+                 "conhost.exe", "wt.exe"]
 
 
 def _win32():
@@ -47,6 +55,8 @@ def _win32():
     u.IsWindow.restype = wintypes.BOOL
     u.IsIconic.argtypes = [wintypes.HWND]
     u.IsIconic.restype = wintypes.BOOL
+    u.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    u.GetAsyncKeyState.restype = ctypes.c_short
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     u.ShowWindow.restype = wintypes.BOOL
     u.SetForegroundWindow.argtypes = [wintypes.HWND]
@@ -116,7 +126,7 @@ def list_windows():
     return out
 
 
-def _is_window(hwnd):
+def is_window(hwnd):
     """这个句柄现在还是不是一个存在的窗口。"""
     try:
         _, _, u, _ = _win32()
@@ -125,13 +135,103 @@ def _is_window(hwnd):
         return False
 
 
+def foreground_hwnd():
+    """当前前台窗口的句柄; 非 Windows / 读不到返回 0。"""
+    try:
+        _, _, u, _ = _win32()
+        return _hwnd(u.GetForegroundWindow())
+    except Exception:
+        return 0
+
+
+def is_window_visible(hwnd):
+    """这个窗口现在可见吗 (最小化/隐藏时为 False)。"""
+    try:
+        _, _, u, _ = _win32()
+        return bool(u.IsWindowVisible(_hwnd(hwnd)))
+    except Exception:
+        return False
+
+
+def left_button_down():
+    """鼠标左键现在是不是按着 (主循环每拍调用, 用上升沿判断点击)。"""
+    try:
+        _, _, u, _ = _win32()
+        return bool(u.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+    except Exception:
+        return False
+
+
+def alt_held():
+    """（左或右）Alt 现在是不是按着。按住 Alt 一般是在用输入法语音听写,
+    这句话用户要自己编辑, 自动发送时不要抢着发出去。"""
+    try:
+        _, _, u, _ = _win32()
+        return bool((u.GetAsyncKeyState(VK_LMENU) & 0x8000)
+                    or (u.GetAsyncKeyState(VK_RMENU) & 0x8000))
+    except Exception:
+        return False
+
+
+def is_terminal_target(cfg):
+    """当前发送目标是不是终端 (终端贴不了图, 图片要降级成地址文字)。
+
+    优先看自动跟随的目标; 没有自动目标时看 --mark-target 标记的窗口。
+    """
+    auto = cfg.get("auto_target_window") or {}
+    exe = str(auto.get("exe") or "").strip().lower()
+    if not exe:
+        target = cfg.get("target_window") or {}
+        exe = str(target.get("exe") or "").strip().lower()
+    return exe in TERMINAL_EXES
+
+
+def update_auto_target(cfg, hwnd, exe):
+    """点击的是终端就把 hwnd 记成自动发送目标; 返回是否更新。只存 hwnd, 不用标题。"""
+    if not hwnd or not exe or exe.strip().lower() not in AUTO_TARGET_EXES:
+        return False
+    old = cfg.get("auto_target_window") or {}
+    if old.get("hwnd") == hwnd:
+        return False
+    cfg["auto_target_window"] = {"hwnd": int(hwnd), "exe": exe}
+    print(f"[目标] 自动跟随: 最近点击的终端 ({exe})")
+    return True
+
+
+def track_auto_target(cfg, rt, down, hwnd, exe):
+    """主循环每拍调用: 左键上升沿且前台是终端时更新自动发送目标。
+
+    点非终端窗口不改目标。rt["lbutton"] 记住上一拍的按键状态。
+    """
+    rising = bool(down) and not rt.get("lbutton")
+    rt["lbutton"] = bool(down)
+    if not rising:
+        return False
+    return update_auto_target(cfg, hwnd, exe)
+
+
+# 上一次打印的匹配日志文本。朗读监控每秒轮询 find_target_window, 同一级命中
+# 连续出现时只打第一行, 免得日志被刷屏; 换了一级才再打。
+# 多线程 (发送 + 朗读监控) 同时读写时, 竞态最多多打一行, 不会崩。
+_last_target_log = None
+
+
+def _log_match(msg):
+    """同一结果连续出现只打印一次; 结果变了才打印新的一行。"""
+    global _last_target_log
+    if msg == _last_target_log:
+        return
+    _last_target_log = msg
+    print(msg)
+
+
 def find_target_window(target):
     """
     按 target_window 找窗口, 三级回退:
     1. exe + 标题子串匹配 (标题会随终端里跑的对话变化, 所以先按标记时的标题找)
     2. 标题没命中时, 标记时的 hwnd 还活着 (IsWindow) 就用它
     3. 还不行就取同 exe 最后一个可见顶层窗口 (EnumWindows 顺序, 通常是最新开的)
-    找不到返回 None。每级命中都打日志说明走的哪一级。
+    找不到返回 None。每级命中都打日志说明走的哪一级 (同一级连续命中只打一次)。
     """
     if not target:
         return None
@@ -144,20 +244,20 @@ def find_target_window(target):
     # 1. exe + 标题子串
     hit = [w for w in same_exe if not sub or sub in w[1].lower()]
     if hit:
-        print("[目标] 标题匹配")
+        _log_match("[目标] 标题匹配")
         for h, _, _ in hit:
             if h == old:
                 return h
         return hit[0][0]
 
     # 2. 标题失配: 标记时的句柄还活着就用它 (窗口没关, 只是标题变了)
-    if old and _is_window(old):
-        print("[目标] 标题失配, 用标记句柄")
+    if old and is_window(old):
+        _log_match("[目标] 标题失配, 用标记句柄")
         return old
 
     # 3. 还没有: 取同 exe 最后一个可见窗口 (通常是最新打开的那个)
     if exe and same_exe:
-        print("[目标] 标题失配, 回退同 exe 窗口")
+        _log_match("[目标] 标题失配, 回退同 exe 窗口")
         return same_exe[-1][0]
 
     return None
