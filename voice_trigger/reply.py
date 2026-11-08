@@ -164,6 +164,31 @@ def _common_suffix(a, b):
         n += 1
     return n
 
+
+def maybe_summarize_for_tts(cfg, text):
+    """朗读前精简长回复: 清洗后超过 tts_summarize_min_chars 字就问 DeepSeek 总结。
+    开关关掉 / 短回复 / 总结失败 (超时、没 key、出错) 都念原文。
+    """
+    n = len(text)
+    if not cfg.get("tts_summarize", True):
+        return text
+    try:
+        if n <= int(cfg.get("tts_summarize_min_chars", 400)):
+            return text
+        max_chars = int(cfg.get("tts_summarize_max_chars", 200))
+    except (TypeError, ValueError):
+        return text
+    try:
+        from .ai import summarize_for_tts
+        summary, why = summarize_for_tts(cfg, text, max_chars)
+    except Exception as e:
+        summary, why = None, type(e).__name__
+    if not summary:
+        print(f"[朗读] 总结失败({why}), 念原文")
+        return text
+    print(f"[朗读] 原文 {n} 字, 精简成 {len(summary)} 字再念")
+    return summary
+
 def watch_reply(cfg, sent_text, speaker, rt):
     """
     发给 AI 后在后台等回复: 每秒读一次聊天窗口的全部文字,
@@ -228,6 +253,7 @@ def watch_reply(cfg, sent_text, speaker, rt):
                     return
                 limit = int(cfg.get("tts_max_chars", 2000))
                 text = text[:limit]
+                text = maybe_summarize_for_tts(cfg, text)
                 try:  # 把这次要念的全文存一份, 方便你核对念的是什么 (只存最后一次)
                     TTS_DIR.mkdir(exist_ok=True)
                     (TTS_DIR / "last_reply.txt").write_text(
@@ -300,6 +326,7 @@ def watch_reply_file(cfg, speaker, rt):
             rt["file_spoke_at"] = t_seen
             rt["tts_watch"] = rt.get("tts_watch", 0) + 1   # 让读窗口的那个停下
             print(f"[朗读] 从文件读到回复 {len(text)} 字 (发出后 {t_seen - sent:.1f}s), 开头: {_flat(text)[:40]}")
+            text = maybe_summarize_for_tts(cfg, text)
             speaker.say(text, t_seen)
 
     threading.Thread(target=run, daemon=True).start()

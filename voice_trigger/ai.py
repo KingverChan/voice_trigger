@@ -81,29 +81,62 @@ def ask_deepseek(cfg, system, user):
     问 DeepSeek 一个"是/否"问题。
     返回 (结果 True/False/None, 说明)。None = 没问成 (超时/出错/没 key/超过每日上限)。
     """
+    ans, why = _deepseek_chat(cfg, system, user, max_tokens=3, count_usage=True)
+    if ans is None:
+        return None, why
+    return ans.startswith("是"), why
+
+
+def summarize_for_tts(cfg, text, max_chars):
+    """把长回复精简成 max_chars 字以内, 给朗读用。
+
+    复用 ai_filter 的 key/base_url/timeout 配置, 但不计入 ai_filter_usage 每日限额。
+    返回 (摘要或 None, 说明)。None = 没总结成 (没 key/超时/出错/空回答)。
+    """
+    max_chars = max(20, int(max_chars))
+    system = (f"用不超过 {max_chars} 字总结下面的内容, 保留关键信息, 不要寒暄。"
+              f"只输出总结正文, 不要加前缀或解释。")
+    ans, why = _deepseek_chat(cfg, system, text,
+                              max_tokens=min(2048, max(64, max_chars * 2)),
+                              count_usage=False)
+    if ans is None:
+        return None, why
+    ans = ans.strip()
+    if not ans:
+        return None, "空回答"
+    return ans, why
+
+
+def _deepseek_chat(cfg, system, user, max_tokens, count_usage):
+    """发一次 DeepSeek chat 请求。返回 (回答文字或 None, 说明)。
+
+    count_usage=True 时才检查每日上限并写 ai_filter_usage.json。
+    """
     import os
     import urllib.request
     key = (cfg.get("ai_filter_api_key") or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if not key:
         return None, "没填 DeepSeek key"
-    today = time.strftime("%Y-%m-%d")
-    try:
-        usage = json.loads(AI_USAGE.read_text(encoding="utf-8"))
-    except Exception:
-        usage = {}
-    n = usage.get(today, 0)
-    if n >= int(cfg.get("ai_filter_daily_limit", 500)):
-        return None, f"今天已经问了 {n} 次, 到上限了"
-    usage = {today: n + 1}
-    try:
-        AI_USAGE.write_text(json.dumps(usage), encoding="utf-8")
-    except OSError:
-        pass
+    n = 0
+    if count_usage:
+        today = time.strftime("%Y-%m-%d")
+        try:
+            usage = json.loads(AI_USAGE.read_text(encoding="utf-8"))
+        except Exception:
+            usage = {}
+        n = usage.get(today, 0)
+        if n >= int(cfg.get("ai_filter_daily_limit", 500)):
+            return None, f"今天已经问了 {n} 次, 到上限了"
+        usage = {today: n + 1}
+        try:
+            AI_USAGE.write_text(json.dumps(usage), encoding="utf-8")
+        except OSError:
+            pass
     body = {
         "model": cfg.get("ai_filter_model", "deepseek-flash"),
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
-        "max_tokens": 3, "temperature": 0, "stream": False,
+        "max_tokens": max_tokens, "temperature": 0, "stream": False,
     }
     if cfg.get("ai_filter_thinking", "disabled"):
         body["thinking"] = {"type": cfg.get("ai_filter_thinking", "disabled")}
@@ -124,4 +157,6 @@ def ask_deepseek(cfg, system, user):
             msg = "超时"
         return None, msg
     dt = time.time() - t0
-    return ans.startswith("是"), f"{ans} ({dt:.1f}s, 今天第 {n + 1} 次)"
+    if count_usage:
+        return ans, f"{ans} ({dt:.1f}s, 今天第 {n + 1} 次)"
+    return ans, f"{dt:.1f}s"

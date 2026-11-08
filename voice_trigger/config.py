@@ -93,6 +93,11 @@ DEFAULT_CONFIG = {
     "tts_voice_zh": "zh-CN-XiaoxiaoNeural",
     "tts_rate": "+0%",               # 语速: "-20%" 慢, "+0%" 正常, "+20%" 快
     "tts_max_chars": 2000,
+    # 朗读前先精简: AI 回复太长时先让 DeepSeek 总结成一小段再念, 不整篇念
+    # (总结复用 ai_filter 的 key/base_url/timeout, 但不计入 ai_filter 每日限额)
+    "tts_summarize": True,
+    "tts_summarize_min_chars": 400,  # 清洗后超过这个字数才总结
+    "tts_summarize_max_chars": 200,  # 总结的目标字数上限
     "tts_stable_s": 1.0,
     # 读文件通道: AI 每次回复后把纯文本写进这个文件, 发发看到文件更新就直接念 (比读窗口快, 也不会念到按钮文字)
     # 文件没更新时, 还是用读窗口的老办法兜底。路径是相对 voice-trigger 文件夹的
